@@ -60,6 +60,46 @@ const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
 const escapeHtml = (s='') => s.replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
+async function waitForIceGathering(peerConnection) {
+  if (peerConnection.iceGatheringState === 'complete') return;
+  await new Promise((resolve) => {
+    const timeout = setTimeout(resolve, 2500);
+    peerConnection.addEventListener('icegatheringstatechange', () => {
+      if (peerConnection.iceGatheringState === 'complete') {
+        clearTimeout(timeout);
+        resolve();
+      }
+    });
+  });
+}
+
+function parseSignalCode(value, expectedType) {
+  const payload = JSON.parse(value.trim());
+  if (payload.type !== expectedType) throw new Error(`Ожидался код ${expectedType}.`);
+  return payload;
+}
+
+class ManualDataConnection {
+  constructor(peer, channel, metadata = null) {
+    this.peer = peer;
+    this.channel = channel;
+    this.metadata = metadata;
+    this.callbacks = { open: [], data: [], close: [], error: [] };
+    this.channel.onopen = () => this.callbacks.open.forEach(callback => callback());
+    this.channel.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      this.callbacks.data.forEach(callback => callback(data));
+    };
+    this.channel.onclose = () => this.callbacks.close.forEach(callback => callback());
+    this.channel.onerror = (event) => this.callbacks.error.forEach(callback => callback(event.error || new Error('Manual WebRTC data channel error')));
+  }
+  get open() { return this.channel.readyState === 'open'; }
+  on(type, callback) { this.callbacks[type]?.push(callback); }
+  send(message) { if (this.open) this.channel.send(JSON.stringify(message)); }
+  close() { this.channel.close(); }
+}
+
+
 class EventBus extends EventTarget {
   emit(type, detail) { this.dispatchEvent(new CustomEvent(type, { detail })); }
   on(type, callback) { this.addEventListener(type, (event) => callback(event.detail)); }
@@ -106,6 +146,8 @@ class NetworkManager {
     this.localPlayer = null;
     this.hostId = null;
     this.isOpening = false;
+    this.manualPeers = new Set();
+    this.manualPending = new Map();
   }
 
   setLocalPlayer(player) { this.localPlayer = player; }
@@ -147,7 +189,7 @@ class NetworkManager {
       } catch (error) {
         lastError = error;
         console.log(`[network] Peer open attempt ${attempt} failed`, error);
-        if (this.peer && !this.peer.destroyed) this.peer.destroy();
+        if (this.peer && !this.peer.destroyed && typeof this.peer.destroy === 'function') this.peer.destroy();
         this.peer = null;
         if (!this.isRetryableOpenError(error) || attempt === maxAttempts) break;
         this.bus.emit('network:status', `PeerJS Cloud не ответил, повторяем попытку ${attempt + 1}/${maxAttempts}…`);
@@ -175,9 +217,79 @@ class NetworkManager {
   closeExistingPeer() {
     this.connections.forEach(conn => conn.close());
     this.connections.clear();
-    if (this.peer && !this.peer.destroyed) this.peer.destroy();
+    if (this.peer && !this.peer.destroyed && typeof this.peer.destroy === 'function') this.peer.destroy();
     this.peer = null;
+    this.manualPeers.forEach(peerConnection => peerConnection.close());
+    this.manualPeers.clear();
+    this.manualPending.clear();
     this.players.clear();
+  }
+
+  startManualHostFallback() {
+    this.closeExistingPeer();
+    this.role = 'host';
+    this.hostId = `banana-host-${uid().slice(0, 8)}`;
+    this.peer = { id: this.hostId, destroyed: false, manual: true };
+    this.localPlayer = { ...this.localPlayer, id: this.hostId, isHost: true, mic: false, connected: true };
+    this.players.set(this.hostId, this.localPlayer);
+    this.bus.emit('network:ready', { role: 'host', peerId: this.hostId });
+    this.bus.emit('players:update', this.getPlayers());
+    this.bus.emit('system', 'PeerJS Cloud недоступен — включён резервный ручной WebRTC-вход.');
+  }
+
+  async createManualOffer() {
+    if (this.role !== 'host') this.startManualHostFallback();
+    const sessionId = uid();
+    const peerConnection = this.createManualPeerConnection();
+    const channel = peerConnection.createDataChannel('banana-play-data', { ordered: true });
+    this.attachManualChannel(peerConnection, channel, `manual-guest-${sessionId.slice(0, 6)}`);
+    await peerConnection.setLocalDescription(await peerConnection.createOffer());
+    await waitForIceGathering(peerConnection);
+    this.manualPending.set(sessionId, peerConnection);
+    return JSON.stringify({ type: 'banana-offer', sessionId, hostId: this.hostId, offer: peerConnection.localDescription }, null, 2);
+  }
+
+  async acceptManualAnswer(answerText) {
+    const answer = parseSignalCode(answerText, 'banana-answer');
+    const peerConnection = this.manualPending.get(answer.sessionId);
+    if (!peerConnection) throw new Error('Offer-сессия не найдена. Создайте новый offer и отправьте его гостю.');
+    await peerConnection.setRemoteDescription(answer.answer);
+    this.manualPending.delete(answer.sessionId);
+  }
+
+  async createManualAnswer(offerText) {
+    const offer = parseSignalCode(offerText, 'banana-offer');
+    this.closeExistingPeer();
+    this.role = 'client';
+    this.hostId = offer.hostId;
+    const clientId = `banana-guest-${uid().slice(0, 8)}`;
+    this.peer = { id: clientId, destroyed: false, manual: true };
+    this.localPlayer = { ...this.localPlayer, id: clientId, isHost: false, mic: false, connected: true };
+    const peerConnection = this.createManualPeerConnection();
+    peerConnection.ondatachannel = (event) => this.attachManualChannel(peerConnection, event.channel, offer.hostId, { player: this.localPlayer });
+    await peerConnection.setRemoteDescription(offer.offer);
+    await peerConnection.setLocalDescription(await peerConnection.createAnswer());
+    await waitForIceGathering(peerConnection);
+    this.bus.emit('network:ready', { role: 'client', peerId: clientId });
+    return JSON.stringify({ type: 'banana-answer', sessionId: offer.sessionId, answer: peerConnection.localDescription }, null, 2);
+  }
+
+  createManualPeerConnection() {
+    const peerConnection = new RTCPeerConnection(PEER_CONFIG.config);
+    this.manualPeers.add(peerConnection);
+    peerConnection.onconnectionstatechange = () => {
+      if (['failed', 'closed', 'disconnected'].includes(peerConnection.connectionState)) this.bus.emit('network:status', `Manual WebRTC: ${peerConnection.connectionState}`);
+    };
+    return peerConnection;
+  }
+
+  attachManualChannel(peerConnection, channel, remotePeerId, metadata = null) {
+    const connection = new ManualDataConnection(remotePeerId, channel, metadata);
+    this.registerConnection(connection);
+    channel.addEventListener('close', () => {
+      this.manualPeers.delete(peerConnection);
+      peerConnection.close();
+    });
   }
 
   bindPeerEvents() {
@@ -324,7 +436,7 @@ class VoiceManager {
   }
 
   callPeers() {
-    if (!this.stream || !this.network.peer) return;
+    if (!this.stream || !this.network.peer || typeof this.network.peer.call !== 'function') return;
     this.network.connections.forEach((_, peerId) => {
       const call = this.network.peer.call(peerId, this.stream);
       call?.on('stream', remoteStream => this.mountRemote(peerId, remoteStream));
@@ -397,6 +509,9 @@ class LobbyApp {
       this.chat.system('Peer ID скопирован в буфер обмена.');
     });
     $('#backToCatalogBtn').addEventListener('click', () => this.showCatalog());
+    $('#manualHostOfferBtn').addEventListener('click', () => this.createManualOffer());
+    $('#manualApplyAnswerBtn').addEventListener('click', () => this.applyManualAnswer());
+    $('#manualCreateAnswerBtn').addEventListener('click', () => this.createManualAnswer());
   }
 
   bindEvents() {
@@ -421,6 +536,7 @@ class LobbyApp {
       $('#connectionStatus').textContent = text;
       $('#roleBadge').textContent = 'error';
       $('#roleBadge').className = 'badge danger';
+      $('#manualSignalPanel').open = true;
       this.chat.system('Ошибка подключения: ' + text);
     });
     this.bus.on('players:update', (players) => this.renderPlayers(players));
@@ -475,6 +591,35 @@ class LobbyApp {
     $('#previewAvatar').textContent = this.profile.avatar;
   }
 
+  async createManualOffer() {
+    try {
+      this.network.setLocalPlayer({ name: this.profile.name || 'Host', avatar: this.profile.avatar });
+      $('#manualOfferOutput').value = await this.network.createManualOffer();
+      this.chat.system('Manual WebRTC offer создан. Отправьте его гостю и вставьте answer обратно.');
+    } catch (error) {
+      this.bus.emit('network:error', error.message);
+    }
+  }
+
+  async applyManualAnswer() {
+    try {
+      await this.network.acceptManualAnswer($('#manualAnswerInput').value);
+      this.chat.system('Manual WebRTC answer принят. Ждём открытия data channel.');
+    } catch (error) {
+      this.bus.emit('network:error', error.message);
+    }
+  }
+
+  async createManualAnswer() {
+    try {
+      this.network.setLocalPlayer({ name: this.profile.name || 'Игрок', avatar: this.profile.avatar });
+      $('#manualAnswerOutput').value = await this.network.createManualAnswer($('#manualOfferInput').value);
+      this.chat.system('Manual WebRTC answer создан. Отправьте его host-пользователю.');
+    } catch (error) {
+      this.bus.emit('network:error', error.message);
+    }
+  }
+
   async createLobbyWithPassword() {
     const password = $('#hostPasswordInput').value;
     // Client-side UX lock: only the owner password unlocks host mode and lobby creation.
@@ -492,6 +637,11 @@ class LobbyApp {
     } catch (error) {
       console.log('[network] Host start failed', error);
       this.bus.emit('network:error', formatPeerError(error));
+      this.network.setLocalPlayer({ name: this.profile.name || 'Host', avatar: this.profile.avatar });
+      this.network.startManualHostFallback();
+      $('#manualSignalPanel').open = true;
+      $('#manualOfferOutput').value = await this.network.createManualOffer();
+      this.chat.system('Автоматически создан manual offer. Отправьте его гостю.');
     }
   }
 

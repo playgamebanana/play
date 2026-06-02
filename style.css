@@ -214,3 +214,11 @@ h3 { font-size: 1.12rem; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+
+.manual-panel { margin-top: .95rem; border: 1px solid rgba(255,212,59,.24); border-radius: 18px; background: rgba(255,212,59,.06); padding: .85rem; }
+.manual-panel summary { cursor: pointer; color: var(--warning); font-weight: 950; }
+.manual-grid { display: grid; gap: .8rem; margin-top: .85rem; }
+.manual-box { display: grid; gap: .55rem; }
+.manual-box strong { color: var(--text); }
+.manual-code { min-height: 86px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: .76rem; line-height: 1.35; }

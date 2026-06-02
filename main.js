@@ -1,4 +1,4 @@
-const HOST_PASSWORD = 'nebula-owner-2026';
+const HOST_PASSWORD = '1234';
 const MAX_PLAYERS = 3;
 const AVATARS = ['🜂','🜁','🜃','🜄','🛸','🦊','🐙','🦉','🐲','🧿','⚡','🌙'];
 
@@ -331,7 +331,7 @@ class LobbyApp {
       $('#connectionStatus').textContent = role === 'host' ? 'Лобби создано · поделитесь Peer ID' : 'Подключение к лобби…';
       $('#chatStatus').textContent = 'online';
       $('#chatStatus').className = 'badge success';
-      this.chat.system(role === 'host' ? 'Вы создали лобби как host.' : 'Вы подключаетесь к host-лобби.');
+      this.chat.system(role === 'host' ? 'Вы создали Banana Play лобби как host.' : 'Вы подключаетесь к Banana Play host-лобби.');
     });
     this.bus.on('network:error', (text) => { $('#connectionStatus').textContent = text; this.chat.system('Ошибка: ' + text); });
     this.bus.on('players:update', (players) => this.renderPlayers(players));
@@ -352,10 +352,10 @@ class LobbyApp {
   }
 
   loadProfile() {
-    const stored = JSON.parse(localStorage.getItem('nebula-profile') || '{}');
+    const stored = JSON.parse(localStorage.getItem('banana-play-profile') || '{}');
     return { name: stored.name || '', avatar: stored.avatar || AVATARS[0] };
   }
-  saveProfile() { localStorage.setItem('nebula-profile', JSON.stringify(this.profile)); }
+  saveProfile() { localStorage.setItem('banana-play-profile', JSON.stringify(this.profile)); }
   showOnboarding() {
     $('#onboarding').classList.add('is-active');
     $('#lobby').classList.remove('is-active');
@@ -426,7 +426,7 @@ class LobbyApp {
 
   renderCatalog() {
     $('#gameCatalog').innerHTML = GAMES.map((game, index) => `
-      <article class="game-card" style="--card-glow:${index % 3 === 0 ? 'rgba(143,91,255,.27)' : index % 3 === 1 ? 'rgba(77,230,255,.22)' : 'rgba(255,139,107,.24)'}">
+      <article class="game-card" style="--card-glow:${index % 3 === 0 ? 'rgba(255,212,59,.28)' : index % 3 === 1 ? 'rgba(126,224,90,.24)' : 'rgba(255,159,28,.24)'}">
         <div>
           <div class="game-preview" data-icon="${game.icon}"></div>
           <h3>${game.title}</h3>

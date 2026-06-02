@@ -93,25 +93,6 @@
             <button id="copyPeerBtn" class="copy-id" title="Скопировать Peer ID"></button>
           </div>
           <p id="networkHint" class="hint">Создавать лобби может только владелец приложения. Остальные игроки подключаются по Peer ID.</p>
-          <details id="manualSignalPanel" class="manual-panel">
-            <summary>Резервный вход без PeerJS Cloud</summary>
-            <p class="hint">Если PeerJS Cloud возвращает server-error, используйте ручной WebRTC-код: host создаёт offer, гость возвращает answer.</p>
-            <div class="manual-grid">
-              <div class="manual-box">
-                <strong>Host</strong>
-                <button id="manualHostOfferBtn" class="btn btn-secondary btn-wide" type="button">Создать offer</button>
-                <textarea id="manualOfferOutput" class="input manual-code" readonly placeholder="Offer для гостя появится здесь"></textarea>
-                <textarea id="manualAnswerInput" class="input manual-code" placeholder="Вставьте answer от гостя"></textarea>
-                <button id="manualApplyAnswerBtn" class="btn btn-primary btn-wide" type="button">Принять answer</button>
-              </div>
-              <div class="manual-box">
-                <strong>Гость</strong>
-                <textarea id="manualOfferInput" class="input manual-code" placeholder="Вставьте offer от host"></textarea>
-                <button id="manualCreateAnswerBtn" class="btn btn-secondary btn-wide" type="button">Создать answer</button>
-                <textarea id="manualAnswerOutput" class="input manual-code" readonly placeholder="Answer для host появится здесь"></textarea>
-              </div>
-            </div>
-          </details>
         </section>
 
         <section class="panel-section players-panel">

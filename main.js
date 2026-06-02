@@ -3,11 +3,8 @@ const MAX_PLAYERS = 3;
 const AVATARS = ['🜂','🜁','🜃','🜄','🛸','🦊','🐙','🦉','🐲','🧿','⚡','🌙'];
 
 
+// Do not set host/key here: PeerJS automatically uses the official Cloud broker when those fields are omitted.
 const PEER_CONFIG = {
-  host: '0.peerjs.com',
-  port: 443,
-  path: '/',
-  secure: true,
   debug: 2,
   config: {
     iceServers: [
@@ -28,7 +25,7 @@ function formatPeerError(error) {
     'invalid-key': 'PeerJS cloud отклонил ключ подключения. Попробуйте обновить страницу.',
     network: 'Не удалось подключиться к PeerJS-серверу. Откройте сайт через http:// или https://, проверьте интернет/VPN/блокировщики и попробуйте снова.',
     'peer-unavailable': 'Хост с таким Peer ID не найден. Проверьте ID и убедитесь, что host-лобби уже создано.',
-    'server-error': 'PeerJS-сервер вернул ошибку. Попробуйте повторить через несколько секунд.',
+    'server-error': 'PeerJS Cloud сейчас недоступен из вашей сети или временно отвечает ошибкой. Приложение уже повторило подключение; попробуйте обновить страницу, отключить VPN/proxy/блокировщик или открыть сайт в другой сети.',
     'socket-error': 'WebSocket до PeerJS-сервера не открылся. Проверьте сеть, VPN, proxy или блокировщики.',
     'socket-closed': 'WebSocket до PeerJS-сервера закрылся. Попробуйте переподключиться.',
     'ssl-unavailable': 'Защищённое соединение с PeerJS-сервером недоступно. Откройте сайт через https://.',
@@ -61,6 +58,7 @@ const now = () => new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minu
 const uid = () => crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2);
 const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
 const escapeHtml = (s='') => s.replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 class EventBus extends EventTarget {
   emit(type, detail) { this.dispatchEvent(new CustomEvent(type, { detail })); }
@@ -107,6 +105,7 @@ class NetworkManager {
     this.players = new Map();
     this.localPlayer = null;
     this.hostId = null;
+    this.isOpening = false;
   }
 
   setLocalPlayer(player) { this.localPlayer = player; }
@@ -114,9 +113,7 @@ class NetworkManager {
   async startHost() {
     this.closeExistingPeer();
     this.role = 'host';
-    this.peer = this.createPeer();
-    this.bindPeerEvents();
-    await this.waitOpen();
+    await this.openPeerWithRetry();
     this.hostId = this.peer.id;
     this.localPlayer = { ...this.localPlayer, id: this.peer.id, isHost: true, mic: false, connected: true };
     this.players.set(this.peer.id, this.localPlayer);
@@ -129,14 +126,40 @@ class NetworkManager {
     this.closeExistingPeer();
     this.role = 'client';
     this.hostId = hostId;
-    this.peer = this.createPeer();
-    this.bindPeerEvents();
-    await this.waitOpen();
+    await this.openPeerWithRetry();
     this.localPlayer = { ...this.localPlayer, id: this.peer.id, isHost: false, mic: false, connected: true };
     const conn = this.peer.connect(hostId, { reliable: true, metadata: { player: this.localPlayer } });
     this.registerConnection(conn);
     this.bus.emit('network:ready', { role: 'client', peerId: this.peer.id });
     console.log('[network] Client peer opened', this.peer.id, 'connecting to', hostId);
+  }
+
+  async openPeerWithRetry(maxAttempts = 3) {
+    let lastError = null;
+    this.isOpening = true;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      this.peer = this.createPeer();
+      this.bindPeerEvents();
+      try {
+        await this.waitOpen();
+        this.isOpening = false;
+        return;
+      } catch (error) {
+        lastError = error;
+        console.log(`[network] Peer open attempt ${attempt} failed`, error);
+        if (this.peer && !this.peer.destroyed) this.peer.destroy();
+        this.peer = null;
+        if (!this.isRetryableOpenError(error) || attempt === maxAttempts) break;
+        this.bus.emit('network:status', `PeerJS Cloud не ответил, повторяем попытку ${attempt + 1}/${maxAttempts}…`);
+        await sleep(650 * attempt);
+      }
+    }
+    this.isOpening = false;
+    throw lastError || new Error('PeerJS open failed');
+  }
+
+  isRetryableOpenError(error) {
+    return ['Error', 'server-error', 'network', 'socket-error', 'socket-closed'].includes(error?.type || error?.name);
   }
 
   createPeer() {
@@ -164,7 +187,7 @@ class NetworkManager {
     this.peer.on('close', () => this.bus.emit('network:status', 'Соединение закрыто.'));
     this.peer.on('error', (error) => {
       console.log('[network] PeerJS error', error);
-      this.bus.emit('network:error', formatPeerError(error));
+      if (!this.isOpening) this.bus.emit('network:error', formatPeerError(error));
     });
   }
 
@@ -393,6 +416,7 @@ class LobbyApp {
       $('#chatStatus').className = 'badge success';
       this.chat.system(role === 'host' ? 'Вы создали Banana Play лобби как host.' : 'Вы подключаетесь к Banana Play host-лобби.');
     });
+    this.bus.on('network:status', (text) => { $('#connectionStatus').textContent = text; });
     this.bus.on('network:error', (text) => {
       $('#connectionStatus').textContent = text;
       $('#roleBadge').textContent = 'error';

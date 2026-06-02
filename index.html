@@ -1,1 +1,184 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="Banana Play: яркий P2P игровой хаб для 2–3 игроков с лобби, чатом, голосом и мини-играми без backend-сервера." />
+  <title>Banana Play — P2P игровой хаб</title>
+  <link rel="preconnect" href="https://unpkg.com" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div class="ambient ambient-one"></div>
+  <div class="ambient ambient-two"></div>
+  <div class="ambient ambient-three"></div>
 
+  <main class="app-shell">
+    <section id="onboarding" class="screen onboarding-screen is-active" aria-label="Создание профиля">
+      <div class="brand-card glass-panel">
+        <div class="brand-mark">🍌</div>
+        <p class="eyebrow">browser only · peer-to-peer · friends table</p>
+        <h1>Banana Play</h1>
+        <p class="hero-copy">Сочный многопользовательский хаб для настольных и быстрых игр. Без сервера: только браузер, PeerJS и WebRTC.</p>
+        <div class="hero-stats">
+          <span>2–3 игрока</span>
+          <span>чат</span>
+          <span>voice</span>
+          <span>мини-игры</span>
+        </div>
+      </div>
+
+      <div class="profile-card glass-panel">
+        <p class="eyebrow accent">шаг 1 · профиль</p>
+        <h2>Собери свой игровой профиль</h2>
+        <label class="field-label" for="nicknameInput">Никнейм</label>
+        <input id="nicknameInput" class="input" type="text" maxlength="18" placeholder="Например, NovaFox" autocomplete="nickname" />
+
+        <div class="avatar-section">
+          <p class="field-label">Аватар</p>
+          <div id="avatarGrid" class="avatar-grid" role="radiogroup" aria-label="Выбор аватарки"></div>
+        </div>
+
+        <div class="profile-preview">
+          <div id="previewAvatar" class="avatar big">🜂</div>
+          <div>
+            <span class="muted">Превью</span>
+            <strong id="previewName">Игрок</strong>
+            <small>данные сохраняются локально</small>
+          </div>
+        </div>
+
+        <button id="enterHubBtn" class="btn btn-primary btn-wide">Войти в хаб</button>
+      </div>
+    </section>
+
+    <section id="lobby" class="screen lobby-screen" aria-label="Игровое лобби">
+      <header class="topbar glass-panel">
+        <div class="topbar-brand">
+          <div class="brand-mark small">🍌</div>
+          <div>
+            <strong>Banana Play</strong>
+            <span id="connectionStatus">Профиль готов · создайте или подключитесь к лобби</span>
+          </div>
+        </div>
+        <div class="topbar-actions">
+          <button id="globalMuteBtn" class="mute-button" title="Mute / Unmute · горячая клавиша M" aria-pressed="true">
+            <span class="mic-orb"><span id="micLevel" class="mic-level"></span></span>
+            <span id="muteLabel">Mic off</span>
+            <kbd>M</kbd>
+          </button>
+          <button id="editProfileBtn" class="btn btn-ghost">Профиль</button>
+        </div>
+      </header>
+
+      <aside class="left-rail glass-panel">
+        <section class="panel-section connect-panel">
+          <div class="section-title-row">
+            <div>
+              <p class="eyebrow">лобби</p>
+              <h2>Подключение</h2>
+            </div>
+            <span id="roleBadge" class="badge neutral">offline</span>
+          </div>
+
+          <button id="openHostModalBtn" class="btn btn-primary btn-wide">Создать лобби</button>
+          <div class="divider"><span>или</span></div>
+          <label class="field-label" for="peerIdInput">Peer ID хоста</label>
+          <div class="inline-form">
+            <input id="peerIdInput" class="input" type="text" placeholder="host-peer-id" />
+            <button id="joinLobbyBtn" class="btn btn-secondary">Войти</button>
+          </div>
+          <div id="ownPeerBox" class="peer-box hidden">
+            <span>Ваш Peer ID</span>
+            <button id="copyPeerBtn" class="copy-id" title="Скопировать Peer ID"></button>
+          </div>
+          <p id="networkHint" class="hint">Создавать лобби может только владелец приложения. Остальные игроки подключаются по Peer ID.</p>
+        </section>
+
+        <section class="panel-section players-panel">
+          <div class="section-title-row">
+            <div>
+              <p class="eyebrow">команда</p>
+              <h2>Игроки</h2>
+            </div>
+            <span id="playerCount" class="badge">0/3</span>
+          </div>
+          <div id="playersList" class="players-list empty-state">Игроки появятся после создания или подключения к лобби.</div>
+        </section>
+
+        <section class="panel-section voice-panel">
+          <div class="section-title-row">
+            <div>
+              <p class="eyebrow">voice</p>
+              <h2>Голос</h2>
+            </div>
+            <span id="voiceStatus" class="badge warning">mic off</span>
+          </div>
+          <p class="hint">Кнопка Mute доступна всегда. Нажмите её или клавишу <kbd>M</kbd>, чтобы включить/выключить микрофон.</p>
+          <div id="remoteAudioMount" class="remote-audio" aria-live="polite"></div>
+        </section>
+      </aside>
+
+      <section class="center-stage glass-panel">
+        <div class="stage-header">
+          <div>
+            <p class="eyebrow">каталог</p>
+            <h2 id="stageTitle">Игровой хаб</h2>
+          </div>
+          <button id="backToCatalogBtn" class="btn btn-ghost hidden">Вернуться в каталог</button>
+        </div>
+        <div id="proposalPanel" class="proposal-panel hidden"></div>
+        <div id="gameCatalog" class="game-catalog"></div>
+        <div id="gameContainer" class="game-container hidden"></div>
+      </section>
+
+      <aside class="right-rail glass-panel">
+        <section class="chat-panel">
+          <div class="section-title-row chat-heading">
+            <div>
+              <p class="eyebrow">live</p>
+              <h2>Чат</h2>
+            </div>
+            <span id="chatStatus" class="badge neutral">ожидание</span>
+          </div>
+          <div id="chatMessages" class="chat-messages empty-state">Здесь появятся системные уведомления и сообщения игроков.</div>
+          <form id="chatForm" class="chat-form">
+            <input id="chatInput" class="input" type="text" maxlength="240" placeholder="Написать сообщение…" />
+            <button class="btn btn-secondary" type="submit">→</button>
+          </form>
+        </section>
+      </aside>
+    </section>
+  </main>
+
+  <dialog id="hostPasswordModal" class="password-modal glass-panel">
+    <form method="dialog" class="modal-content">
+      <button class="modal-close" value="cancel" aria-label="Закрыть">×</button>
+      <p class="eyebrow accent">host only</p>
+      <h2>Пароль владельца</h2>
+      <p class="muted">Лобби может создать только владелец приложения. После верного пароля вы станете host и получите Peer ID.</p>
+      <label class="field-label" for="hostPasswordInput">Пароль</label>
+      <input id="hostPasswordInput" class="input" type="password" placeholder="Введите пароль" autocomplete="current-password" />
+      <p id="passwordError" class="error-text hidden">Неверный пароль. Создание лобби заблокировано.</p>
+      <div class="modal-actions">
+        <button value="cancel" class="btn btn-ghost">Отмена</button>
+        <button id="confirmHostBtn" value="default" class="btn btn-primary">Создать</button>
+      </div>
+    </form>
+  </dialog>
+
+  <template id="playerTemplate">
+    <article class="player-card">
+      <div class="avatar"></div>
+      <div class="player-meta">
+        <strong></strong>
+        <span></span>
+      </div>
+      <div class="player-flags"></div>
+    </article>
+  </template>
+
+  <script src="https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js" onerror="this.onerror=null;this.src='https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js'"></script>
+  <script type="module" src="main.js"></script>
+</body>
+</html>

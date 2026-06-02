@@ -2,6 +2,46 @@ const HOST_PASSWORD = '1234';
 const MAX_PLAYERS = 3;
 const AVATARS = ['🜂','🜁','🜃','🜄','🛸','🦊','🐙','🦉','🐲','🧿','⚡','🌙'];
 
+
+const PEER_CONFIG = {
+  host: '0.peerjs.com',
+  port: 443,
+  path: '/',
+  secure: true,
+  debug: 2,
+  config: {
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:global.stun.twilio.com:3478' },
+    ],
+  },
+};
+
+function formatPeerError(error) {
+  const type = error?.type || error?.name || '';
+  const rawMessage = typeof error === 'string' ? error : (error?.message || '');
+  const message = rawMessage && rawMessage !== 'Error' ? rawMessage : '';
+  const hints = {
+    'browser-incompatible': 'Браузер не поддерживает WebRTC/PeerJS. Попробуйте актуальный Chrome, Edge или Firefox.',
+    disconnected: 'PeerJS-сервер временно недоступен или соединение оборвалось. Проверьте интернет и попробуйте ещё раз.',
+    'invalid-id': 'Некорректный Peer ID. Проверьте ID хоста и повторите подключение.',
+    'invalid-key': 'PeerJS cloud отклонил ключ подключения. Попробуйте обновить страницу.',
+    network: 'Не удалось подключиться к PeerJS-серверу. Откройте сайт через http:// или https://, проверьте интернет/VPN/блокировщики и попробуйте снова.',
+    'peer-unavailable': 'Хост с таким Peer ID не найден. Проверьте ID и убедитесь, что host-лобби уже создано.',
+    'server-error': 'PeerJS-сервер вернул ошибку. Попробуйте повторить через несколько секунд.',
+    'socket-error': 'WebSocket до PeerJS-сервера не открылся. Проверьте сеть, VPN, proxy или блокировщики.',
+    'socket-closed': 'WebSocket до PeerJS-сервера закрылся. Попробуйте переподключиться.',
+    'ssl-unavailable': 'Защищённое соединение с PeerJS-сервером недоступно. Откройте сайт через https://.',
+    'unavailable-id': 'Этот Peer ID уже занят. Обновите страницу и попробуйте снова.',
+    webrtc: 'WebRTC-соединение не установилось. Проверьте разрешения браузера и сетевые ограничения.',
+  };
+  if (type === 'Error' && !message) {
+    return 'Не удалось запустить P2P-подключение. Чаще всего это блокировка PeerJS/WebSocket сетью, VPN, proxy или расширением браузера. Попробуйте обновить страницу или открыть сайт через GitHub Pages/http(s).';
+  }
+  const hint = hints[type] || message || 'Неизвестная ошибка PeerJS. Проверьте интернет, откройте сайт через http(s) и попробуйте обновить страницу.';
+  return type && type !== 'Error' && !hint.includes(type) ? `${hint} (${type})` : hint;
+}
+
 const GAMES = [
   { id: 'monopoly', title: 'Монополия', icon: '🏙️', status: 'soon', description: 'Большая экономическая классика с торгами, арендой и сделками. Экран будущего расширения.' },
   { id: 'machi', title: 'Мачи Коро', icon: '🏗️', status: 'soon', description: 'Городская карточная стратегия. В каталоге подготовлен премиальный preview и заглушка.' },
@@ -72,8 +112,9 @@ class NetworkManager {
   setLocalPlayer(player) { this.localPlayer = player; }
 
   async startHost() {
+    this.closeExistingPeer();
     this.role = 'host';
-    this.peer = new Peer();
+    this.peer = this.createPeer();
     this.bindPeerEvents();
     await this.waitOpen();
     this.hostId = this.peer.id;
@@ -85,9 +126,10 @@ class NetworkManager {
   }
 
   async join(hostId) {
+    this.closeExistingPeer();
     this.role = 'client';
     this.hostId = hostId;
-    this.peer = new Peer();
+    this.peer = this.createPeer();
     this.bindPeerEvents();
     await this.waitOpen();
     this.localPlayer = { ...this.localPlayer, id: this.peer.id, isHost: false, mic: false, connected: true };
@@ -97,6 +139,24 @@ class NetworkManager {
     console.log('[network] Client peer opened', this.peer.id, 'connecting to', hostId);
   }
 
+  createPeer() {
+    if (!window.Peer) {
+      throw new Error('PeerJS не загрузился. Проверьте интернет, доступ к CDN unpkg.com или подключите библиотеку локально.');
+    }
+    if (location.protocol === 'file:') {
+      console.warn('[network] App is opened via file://; PeerJS/WebRTC can be unstable. Use a local http server or GitHub Pages.');
+    }
+    return new Peer(undefined, PEER_CONFIG);
+  }
+
+  closeExistingPeer() {
+    this.connections.forEach(conn => conn.close());
+    this.connections.clear();
+    if (this.peer && !this.peer.destroyed) this.peer.destroy();
+    this.peer = null;
+    this.players.clear();
+  }
+
   bindPeerEvents() {
     this.peer.on('connection', (conn) => this.registerConnection(conn));
     this.peer.on('call', (call) => this.bus.emit('voice:incoming-call', call));
@@ -104,7 +164,7 @@ class NetworkManager {
     this.peer.on('close', () => this.bus.emit('network:status', 'Соединение закрыто.'));
     this.peer.on('error', (error) => {
       console.log('[network] PeerJS error', error);
-      this.bus.emit('network:error', error.message || String(error));
+      this.bus.emit('network:error', formatPeerError(error));
     });
   }
 
@@ -137,7 +197,7 @@ class NetworkManager {
     });
     conn.on('data', (message) => this.handleMessage(conn.peer, message));
     conn.on('close', () => this.handleClose(conn.peer));
-    conn.on('error', (error) => this.bus.emit('network:error', error.message || String(error)));
+    conn.on('error', (error) => this.bus.emit('network:error', formatPeerError(error)));
   }
 
   handleMessage(from, message) {
@@ -333,7 +393,12 @@ class LobbyApp {
       $('#chatStatus').className = 'badge success';
       this.chat.system(role === 'host' ? 'Вы создали Banana Play лобби как host.' : 'Вы подключаетесь к Banana Play host-лобби.');
     });
-    this.bus.on('network:error', (text) => { $('#connectionStatus').textContent = text; this.chat.system('Ошибка: ' + text); });
+    this.bus.on('network:error', (text) => {
+      $('#connectionStatus').textContent = text;
+      $('#roleBadge').textContent = 'error';
+      $('#roleBadge').className = 'badge danger';
+      this.chat.system('Ошибка подключения: ' + text);
+    });
     this.bus.on('players:update', (players) => this.renderPlayers(players));
     this.bus.on('network:message', ({ message }) => this.routeMessage(message));
   }
@@ -397,14 +462,26 @@ class LobbyApp {
     $('#passwordError').classList.add('hidden');
     $('#hostPasswordModal').close();
     this.network.setLocalPlayer({ name: this.profile.name || 'Host', avatar: this.profile.avatar });
-    await this.network.startHost();
+    try {
+      $('#connectionStatus').textContent = 'Создаём Banana Play лобби…';
+      await this.network.startHost();
+    } catch (error) {
+      console.log('[network] Host start failed', error);
+      this.bus.emit('network:error', formatPeerError(error));
+    }
   }
 
   async joinLobby() {
     const hostId = $('#peerIdInput').value.trim();
     if (!hostId) return this.chat.system('Введите Peer ID существующего host-лобби.');
     this.network.setLocalPlayer({ name: this.profile.name || 'Игрок', avatar: this.profile.avatar });
-    await this.network.join(hostId);
+    try {
+      $('#connectionStatus').textContent = 'Подключаемся к Banana Play лобби…';
+      await this.network.join(hostId);
+    } catch (error) {
+      console.log('[network] Join failed', error);
+      this.bus.emit('network:error', formatPeerError(error));
+    }
   }
 
   renderPlayers(players) {

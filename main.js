@@ -1,62 +1,44 @@
+import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js';
+import { getAuth, signInAnonymously } from 'https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js';
+import {
+  addDoc,
+  collection,
+  doc,
+  getDoc,
+  getFirestore,
+  onSnapshot,
+  runTransaction,
+  serverTimestamp,
+  setDoc,
+  updateDoc,
+} from 'https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js';
+
 const HOST_PASSWORD = '1234';
 const MAX_PLAYERS = 3;
 const AVATARS = ['🜂','🜁','🜃','🜄','🛸','🦊','🐙','🦉','🐲','🧿','⚡','🌙'];
-
-
-// Keep PeerJS transport options centralized so the app can switch from PeerJS Cloud
-// to a self-hosted PeerServer by filling host/path without changing lobby logic.
-const PEER_CONFIG = {
-  host: '',
-  port: 443,
-  path: '/peerjs',
-  secure: true,
-  debug: 2,
-  config: {
-    iceServers: [
-      { urls: 'stun:stun.l.google.com:19302' },
-      { urls: 'stun:global.stun.twilio.com:3478' },
-    ],
-  },
+const LOBBY_CODE_LENGTH = 5;
+const FIRESTORE_STATE_TIMEOUT_MS = 5000;
+const RTC_CONFIG = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+const FIREBASE_CONFIG = window.BANANA_FIREBASE_CONFIG || {
+  apiKey: '',
+  authDomain: '',
+  projectId: '',
+  appId: '',
 };
 
-const PING_TIMEOUT_MS = 5000;
-const STATE_SYNC_TIMEOUT_MS = 5000;
-const CLIENT_RECONNECT_INTERVAL_MS = 3000;
-const CLIENT_RECONNECT_MAX_ATTEMPTS = 10;
-
-function formatPeerError(error) {
-  const type = error?.type || error?.name || '';
-  const rawMessage = typeof error === 'string' ? error : (error?.message || '');
-  const message = rawMessage && rawMessage !== 'Error' ? rawMessage : '';
-  const hints = {
-    'browser-incompatible': 'Браузер не поддерживает WebRTC/PeerJS. Попробуйте актуальный Chrome, Edge или Firefox.',
-    disconnected: 'PeerJS-сервер временно недоступен или соединение оборвалось. Проверьте интернет и попробуйте ещё раз.',
-    'invalid-id': 'Некорректный Peer ID. Проверьте ID хоста и повторите подключение.',
-    'invalid-key': 'PeerJS cloud отклонил ключ подключения. Попробуйте обновить страницу.',
-    network: 'PeerJS Cloud недоступен из этой сети. Проверьте блокировку WebSocket, корпоративный firewall, провайдера, DNS/VPN или используйте собственный PeerServer.',
-    'peer-unavailable': 'Лобби не найдено. Проверьте Peer ID или попросите host пересоздать лобби.',
-    'server-error': 'PeerJS Cloud сейчас недоступен из вашей сети или временно отвечает ошибкой. Приложение уже повторило подключение; попробуйте обновить страницу, отключить VPN/proxy/блокировщик или открыть сайт в другой сети.',
-    'socket-error': 'WebSocket до PeerJS Cloud не открылся. Сеть, провайдер, firewall, proxy или расширение могут блокировать PeerJS Cloud.',
-    'socket-closed': 'WebSocket до PeerJS Cloud закрылся. Соединение с брокером недоступно или нестабильно.',
-    'ssl-unavailable': 'Защищённое соединение с PeerJS-сервером недоступно. Откройте сайт через https://.',
-    'unavailable-id': 'Этот Peer ID уже занят. Обновите страницу и попробуйте снова.',
-    webrtc: 'WebRTC-соединение не установилось. Проверьте разрешения браузера и сетевые ограничения.',
-  };
-  if (type === 'Error' && !message) {
-    return 'Не удалось запустить P2P-подключение. Чаще всего это блокировка PeerJS/WebSocket сетью, VPN, proxy или расширением браузера. Попробуйте обновить страницу или открыть сайт через GitHub Pages/http(s).';
+function assertFirebaseConfig() {
+  const missing = ['apiKey', 'authDomain', 'projectId', 'appId'].filter(key => !FIREBASE_CONFIG[key]);
+  if (missing.length) {
+    throw new Error(`Firebase не настроен: заполните FIREBASE_CONFIG (${missing.join(', ')}) или window.BANANA_FIREBASE_CONFIG.`);
   }
-  const hint = hints[type] || message || 'Неизвестная ошибка PeerJS. Проверьте интернет, откройте сайт через http(s) и попробуйте обновить страницу.';
-  return type && type !== 'Error' && !hint.includes(type) ? `${hint} (${type})` : hint;
 }
 
-
-function isPeerCloudUnavailable(error) {
-  return ['network', 'socket-error', 'socket-closed', 'server-error', 'disconnected'].includes(error?.type || error?.name);
-}
-
-function peerCloudUnavailableMessage(error) {
-  const reason = error?.type || error?.name || 'network';
-  return `PeerJS Cloud недоступен (${reason}). Приложение использует только PeerJS/WebRTC; проверьте WebSocket-блокировки, firewall, DNS, VPN/Proxy или переключите PEER_CONFIG.host на собственный PeerServer.`;
+function formatFirebaseError(error) {
+  const code = error?.code || error?.name || 'unknown';
+  if (code === 'permission-denied') return 'Firestore permission denied: проверьте rules для lobbies/signals/candidates.';
+  if (code === 'not-found') return 'Лобби не найдено';
+  if (code === 'unavailable') return 'Firestore временно недоступен. Проверьте интернет или Firebase status.';
+  return error?.message || String(error);
 }
 
 const GAMES = [
@@ -131,421 +113,539 @@ class ChatManager {
   system(text) { this.add({ kind: 'system', text }); }
 }
 
+class FirebaseLobbyManager {
+  constructor() {
+    this.app = null;
+    this.auth = null;
+    this.db = null;
+    this.user = null;
+    this.unsubscribers = [];
+  }
+
+  async init() {
+    if (this.db && this.user) return this;
+    assertFirebaseConfig();
+    this.app = this.app || initializeApp(FIREBASE_CONFIG);
+    this.auth = this.auth || getAuth(this.app);
+    this.db = this.db || getFirestore(this.app);
+    if (!this.auth.currentUser) {
+      console.log('[FIREBASE] anonymous auth start');
+      await signInAnonymously(this.auth);
+    }
+    this.user = this.auth.currentUser;
+    console.log('[FIREBASE] ready', this.user.uid);
+    return this;
+  }
+
+  get userId() { return this.user?.uid; }
+  lobbyRef(lobbyId) { return doc(this.db, 'lobbies', lobbyId); }
+  playersRef(lobbyId) { return collection(this.lobbyRef(lobbyId), 'players'); }
+  playerRef(lobbyId, playerId) { return doc(this.playersRef(lobbyId), playerId); }
+  signalsRef(lobbyId) { return collection(this.lobbyRef(lobbyId), 'signals'); }
+  signalRef(lobbyId, guestId) { return doc(this.signalsRef(lobbyId), guestId); }
+  candidateRef(lobbyId, guestId, side) { return collection(this.signalRef(lobbyId, guestId), side); }
+
+  generateLobbyId() {
+    const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    return Array.from({ length: LOBBY_CODE_LENGTH }, () => alphabet[Math.floor(Math.random() * alphabet.length)]).join('');
+  }
+
+  async createLobby(player) {
+    await this.init();
+    for (let attempt = 0; attempt < 8; attempt += 1) {
+      const lobbyId = this.generateLobbyId();
+      const lobbyRef = this.lobbyRef(lobbyId);
+      const snapshot = await getDoc(lobbyRef);
+      if (snapshot.exists()) continue;
+      console.log('[LOBBY] creating', lobbyId);
+      await setDoc(lobbyRef, {
+        lobbyId,
+        hostId: player.id,
+        status: 'open',
+        maxPlayers: MAX_PLAYERS,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+        deleteAt: new Date(Date.now() + 1000 * 60 * 60),
+        playerCount: 1,
+      });
+      await setDoc(this.playerRef(lobbyId, player.id), {
+        nickname: player.name,
+        avatar: player.avatar,
+        online: true,
+        micEnabled: Boolean(player.mic),
+        isHost: true,
+        joinedAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+      console.log('[LOBBY] created', lobbyId);
+      return { lobbyId, hostId: player.id };
+    }
+    throw new Error('Не удалось сгенерировать свободный код лобби. Попробуйте ещё раз.');
+  }
+
+  async joinLobby(lobbyId, player) {
+    await this.init();
+    const normalizedId = lobbyId.trim().toUpperCase();
+    const lobbyRef = this.lobbyRef(normalizedId);
+    let hostId = null;
+    await runTransaction(this.db, async (transaction) => {
+      const lobbySnapshot = await transaction.get(lobbyRef);
+      if (!lobbySnapshot.exists()) throw new Error('Лобби не найдено');
+      const lobby = lobbySnapshot.data();
+      if (lobby.status !== 'open') throw new Error('Лобби закрыто');
+      hostId = lobby.hostId;
+      const playerRef = this.playerRef(normalizedId, player.id);
+      const playerSnapshot = await transaction.get(playerRef);
+      const nextCount = playerSnapshot.exists() ? (lobby.playerCount || 1) : (lobby.playerCount || 1) + 1;
+      if (nextCount > MAX_PLAYERS) throw new Error('Лобби заполнено: максимум 3 игрока.');
+      transaction.set(playerRef, {
+        nickname: player.name,
+        avatar: player.avatar,
+        online: true,
+        micEnabled: Boolean(player.mic),
+        isHost: false,
+        joinedAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      }, { merge: true });
+      transaction.update(lobbyRef, { playerCount: nextCount, updatedAt: serverTimestamp() });
+    });
+    console.log('[LOBBY] joined', normalizedId, player.id);
+    return { lobbyId: normalizedId, hostId };
+  }
+
+
+  mapPlayer(playerDoc) {
+    const data = playerDoc.data();
+    return {
+      id: playerDoc.id,
+      name: data.nickname || 'Игрок',
+      avatar: data.avatar || AVATARS[0],
+      isHost: Boolean(data.isHost),
+      connected: data.online !== false,
+      mic: Boolean(data.micEnabled),
+    };
+  }
+
+  subscribeLobby(lobbyId, onLobby, onPlayers, onError) {
+    const unsubLobby = onSnapshot(this.lobbyRef(lobbyId), (snapshot) => {
+      if (!snapshot.exists()) {
+        onError?.(new Error('Лобби не найдено'));
+        return;
+      }
+      onLobby(snapshot.data());
+    }, onError);
+    const unsubPlayers = onSnapshot(this.playersRef(lobbyId), (snapshot) => {
+      onPlayers(snapshot.docs.map(playerDoc => this.mapPlayer(playerDoc)));
+    }, onError);
+    this.unsubscribers.push(unsubLobby, unsubPlayers);
+  }
+
+  listenGuestSignals(lobbyId, onOffer, onError) {
+    const unsubscribe = onSnapshot(this.signalsRef(lobbyId), (snapshot) => {
+      snapshot.docChanges().forEach((change) => {
+        const data = change.doc.data();
+        if ((change.type === 'added' || change.type === 'modified') && data.offer && !data.answer) {
+          onOffer(change.doc.id, data.offer);
+        }
+      });
+    }, onError);
+    this.unsubscribers.push(unsubscribe);
+  }
+
+  listenSignal(lobbyId, guestId, onSignal, onError) {
+    const unsubscribe = onSnapshot(this.signalRef(lobbyId, guestId), (snapshot) => {
+      if (snapshot.exists()) onSignal(snapshot.data());
+    }, onError);
+    this.unsubscribers.push(unsubscribe);
+  }
+
+  listenIceCandidates(lobbyId, guestId, side, onCandidate, onError) {
+    const unsubscribe = onSnapshot(this.candidateRef(lobbyId, guestId, side), (snapshot) => {
+      snapshot.docChanges().forEach((change) => {
+        if (change.type === 'added') onCandidate(change.doc.data());
+      });
+    }, onError);
+    this.unsubscribers.push(unsubscribe);
+  }
+
+  async setOffer(lobbyId, guestId, offer) {
+    console.log('[FIREBASE] set offer', lobbyId, guestId);
+    await setDoc(this.signalRef(lobbyId, guestId), { offer, createdAt: serverTimestamp(), updatedAt: serverTimestamp() }, { merge: true });
+  }
+
+  async setAnswer(lobbyId, guestId, answer) {
+    console.log('[FIREBASE] set answer', lobbyId, guestId);
+    await setDoc(this.signalRef(lobbyId, guestId), { answer, updatedAt: serverTimestamp() }, { merge: true });
+  }
+
+  async addIceCandidate(lobbyId, guestId, side, candidate) {
+    console.log('[ICE] add', side, guestId);
+    await addDoc(this.candidateRef(lobbyId, guestId, side), { ...candidate, createdAt: serverTimestamp() });
+  }
+
+  async updatePlayer(lobbyId, playerId, patch) {
+    await updateDoc(this.playerRef(lobbyId, playerId), { ...patch, updatedAt: serverTimestamp() });
+  }
+
+  async closeLobby(lobbyId) {
+    if (!lobbyId) return;
+    console.log('[LOBBY] closing', lobbyId);
+    await updateDoc(this.lobbyRef(lobbyId), { status: 'closed', closedAt: serverTimestamp(), updatedAt: serverTimestamp(), deleteAt: new Date(Date.now() + 1000 * 60 * 10) }).catch(() => {});
+  }
+
+  async setOffline(lobbyId, playerId) {
+    if (!lobbyId || !playerId) return;
+    const lobbyRef = this.lobbyRef(lobbyId);
+    const playerRef = this.playerRef(lobbyId, playerId);
+    await runTransaction(this.db, async (transaction) => {
+      const lobbySnapshot = await transaction.get(lobbyRef);
+      const playerSnapshot = await transaction.get(playerRef);
+      if (!lobbySnapshot.exists() || !playerSnapshot.exists()) return;
+      const wasOnline = playerSnapshot.data().online !== false;
+      const nextCount = wasOnline ? Math.max((lobbySnapshot.data().playerCount || 1) - 1, 0) : (lobbySnapshot.data().playerCount || 0);
+      transaction.update(playerRef, { online: false, updatedAt: serverTimestamp() });
+      transaction.update(lobbyRef, { playerCount: nextCount, updatedAt: serverTimestamp() });
+    }).catch(() => {});
+  }
+
+  cleanup() {
+    this.unsubscribers.splice(0).forEach(unsubscribe => unsubscribe());
+  }
+}
+
+class WebRTCManager {
+  constructor(bus, firebaseLobby) {
+    this.bus = bus;
+    this.firebaseLobby = firebaseLobby;
+    this.role = 'offline';
+    this.lobbyId = null;
+    this.localPlayerId = null;
+    this.hostId = null;
+    this.localStream = null;
+    this.peerConnections = new Map();
+    this.dataChannels = new Map();
+    this.pendingDataChannels = new Map();
+    this.onDataMessage = null;
+  }
+
+  configure({ role, lobbyId, localPlayerId, hostId }) {
+    this.role = role;
+    this.lobbyId = lobbyId;
+    this.localPlayerId = localPlayerId;
+    this.hostId = hostId;
+  }
+
+  async startHost() {
+    console.log('[WEBRTC] host ready for offers', this.lobbyId);
+    this.firebaseLobby.listenGuestSignals(this.lobbyId, (guestId, offer) => this.acceptOffer(guestId, offer), error => this.emitError(error));
+  }
+
+  async connectAsGuest() {
+    console.log('[WEBRTC] guest creating offer', this.lobbyId, this.localPlayerId);
+    const pc = this.createPeerConnection(this.hostId, this.localPlayerId, false);
+    const channel = pc.createDataChannel('banana-data', { ordered: true });
+    this.attachDataChannel(this.hostId, channel);
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await this.firebaseLobby.setOffer(this.lobbyId, this.localPlayerId, offer.toJSON());
+    this.firebaseLobby.listenSignal(this.lobbyId, this.localPlayerId, async (signal) => {
+      if (signal.answer && !pc.currentRemoteDescription) {
+        console.log('[WEBRTC] answer received', this.localPlayerId);
+        await pc.setRemoteDescription(new RTCSessionDescription(signal.answer));
+      }
+    }, error => this.emitError(error));
+    this.firebaseLobby.listenIceCandidates(this.lobbyId, this.localPlayerId, 'hostCandidates', candidate => this.addRemoteIce(this.hostId, candidate), error => this.emitError(error));
+    await this.waitForDataChannel(this.hostId);
+  }
+
+  async acceptOffer(guestId, offer) {
+    if (this.peerConnections.has(guestId)) return;
+    console.log('[WEBRTC] host accepting offer', guestId);
+    const pc = this.createPeerConnection(guestId, guestId, true);
+    await pc.setRemoteDescription(new RTCSessionDescription(offer));
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    await this.firebaseLobby.setAnswer(this.lobbyId, guestId, answer.toJSON());
+    this.firebaseLobby.listenIceCandidates(this.lobbyId, guestId, 'guestCandidates', candidate => this.addRemoteIce(guestId, candidate), error => this.emitError(error));
+  }
+
+  createPeerConnection(remoteId, signalId, isHost) {
+    console.log('[WEBRTC] create RTCPeerConnection', remoteId);
+    const pc = new RTCPeerConnection(RTC_CONFIG);
+    this.peerConnections.set(remoteId, pc);
+    if (this.localStream) {
+      this.localStream.getTracks().forEach(track => pc.addTrack(track, this.localStream));
+    } else {
+      pc.addTransceiver('audio', { direction: 'sendrecv' });
+    }
+    pc.onicecandidate = (event) => {
+      if (!event.candidate) return;
+      const side = isHost ? 'hostCandidates' : 'guestCandidates';
+      console.log('[ICE] local candidate', side, remoteId);
+      this.firebaseLobby.addIceCandidate(this.lobbyId, signalId, side, event.candidate.toJSON()).catch(error => this.emitError(error));
+    };
+    pc.onconnectionstatechange = () => {
+      console.log('[WEBRTC] connection state', remoteId, pc.connectionState);
+      if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) this.bus.emit('network:status', `WebRTC ${remoteId}: ${pc.connectionState}`);
+    };
+    pc.ondatachannel = (event) => this.attachDataChannel(remoteId, event.channel);
+    pc.ontrack = (event) => {
+      const [stream] = event.streams;
+      if (stream) this.bus.emit('voice:remote-stream', { peerId: remoteId, stream });
+    };
+    return pc;
+  }
+
+  attachDataChannel(remoteId, channel) {
+    console.log('[DATA_CHANNEL] attach', remoteId);
+    this.dataChannels.set(remoteId, channel);
+    channel.onopen = () => {
+      console.log('[DATA_CHANNEL] open', remoteId);
+      this.resolveDataChannel(remoteId, channel);
+      this.bus.emit('network:connection-open', remoteId);
+    };
+    channel.onmessage = (event) => {
+      try {
+        const message = JSON.parse(event.data);
+        console.log('[DATA_CHANNEL] message', remoteId, message.type);
+        this.onDataMessage?.(remoteId, message);
+      } catch (error) {
+        this.emitError(error);
+      }
+    };
+    channel.onclose = () => {
+      console.log('[DATA_CHANNEL] closed', remoteId);
+      this.dataChannels.delete(remoteId);
+      this.bus.emit('network:status', `DataChannel закрыт: ${remoteId}`);
+    };
+    channel.onerror = (error) => this.emitError(error);
+    if (channel.readyState === 'open') channel.onopen();
+  }
+
+  waitForDataChannel(remoteId, timeoutMs = FIRESTORE_STATE_TIMEOUT_MS) {
+    const existing = this.dataChannels.get(remoteId);
+    if (existing?.readyState === 'open') return Promise.resolve(existing);
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingDataChannels.delete(remoteId);
+        reject(new Error('WebRTC DataChannel не открылся. Проверьте STUN/WebRTC доступность сети.'));
+      }, timeoutMs);
+      this.pendingDataChannels.set(remoteId, { resolve, reject, timer });
+    });
+  }
+
+  resolveDataChannel(remoteId, channel) {
+    const pending = this.pendingDataChannels.get(remoteId);
+    if (!pending) return;
+    clearTimeout(pending.timer);
+    pending.resolve(channel);
+    this.pendingDataChannels.delete(remoteId);
+  }
+
+  async addRemoteIce(remoteId, candidate) {
+    const pc = this.peerConnections.get(remoteId);
+    if (!pc || !candidate?.candidate) return;
+    console.log('[ICE] remote candidate', remoteId);
+    await pc.addIceCandidate(new RTCIceCandidate(candidate)).catch(error => this.emitError(error));
+  }
+
+  setLocalStream(stream) {
+    this.localStream = stream;
+    const [audioTrack] = stream.getAudioTracks();
+    this.peerConnections.forEach((pc) => {
+      const sender = pc.getSenders().find(item => item.track?.kind === 'audio' || item.track === null);
+      if (sender && audioTrack) {
+        sender.replaceTrack(audioTrack).catch(error => this.emitError(error));
+        return;
+      }
+      stream.getTracks().forEach(track => pc.addTrack(track, stream));
+    });
+  }
+
+  sendTo(remoteId, message) {
+    const channel = this.dataChannels.get(remoteId);
+    if (!channel || channel.readyState !== 'open') {
+      console.warn('[DATA_CHANNEL] not open', remoteId, message.type);
+      return false;
+    }
+    console.log('[DATA_CHANNEL] send', remoteId, message.type);
+    channel.send(JSON.stringify(message));
+    return true;
+  }
+
+  broadcast(message) {
+    this.dataChannels.forEach((_, remoteId) => this.sendTo(remoteId, message));
+  }
+
+  close() {
+    this.pendingDataChannels.forEach(({ reject, timer }) => {
+      clearTimeout(timer);
+      reject(new Error('WebRTC connection closed'));
+    });
+    this.pendingDataChannels.clear();
+    this.dataChannels.forEach(channel => channel.close());
+    this.peerConnections.forEach(pc => pc.close());
+    this.dataChannels.clear();
+    this.peerConnections.clear();
+  }
+
+  emitError(error) {
+    console.log('[WEBRTC] error', error);
+    this.bus.emit('network:error', formatFirebaseError(error));
+  }
+}
+
 class NetworkManager {
   constructor(bus) {
     this.bus = bus;
-    this.peer = null;
     this.role = 'offline';
     this.connections = new Map();
     this.players = new Map();
     this.localPlayer = null;
+    this.localPlayerId = null;
+    this.lobbyId = null;
     this.hostId = null;
-    this.isOpening = false;
-    this.isHostReady = false;
-    this.isReconnectingHost = false;
-    this.isClosingPeer = false;
-    this.clientReconnectTimer = null;
-    this.clientReconnectAttempts = 0;
-    this.pendingPings = new Map();
     this.pendingStateSync = null;
+    this.firebaseLobby = new FirebaseLobbyManager();
+    this.webrtc = new WebRTCManager(bus, this.firebaseLobby);
+    this.webrtc.onDataMessage = (from, message) => this.handleDataMessage(from, message);
+    window.addEventListener('beforeunload', () => this.close());
   }
 
-  setLocalPlayer(player) { this.localPlayer = player; }
+  setLocalPlayer(player) { this.localPlayer = { ...this.localPlayer, ...player }; }
+
+  async prepareLocalPlayer(isHost = false) {
+    await this.firebaseLobby.init();
+    this.localPlayerId = this.firebaseLobby.userId;
+    this.localPlayer = {
+      ...this.localPlayer,
+      id: this.localPlayerId,
+      isHost,
+      mic: Boolean(this.localPlayer?.mic),
+      connected: true,
+    };
+  }
 
   async startHost() {
-    this.closeExistingPeer();
+    this.close(false);
     this.role = 'host';
-    this.isHostReady = false;
     this.bus.emit('network:preparing-host');
-    this.bus.emit('network:status', 'Подготовка лобби...');
-    await this.openPeerWithRetry('host');
-    console.log('[DEBUG] HOST OPEN', this.peer.id);
-    this.hostId = this.peer.id;
-    this.localPlayer = { ...this.localPlayer, id: this.peer.id, isHost: true, mic: false, connected: true };
-    this.players.set(this.peer.id, this.localPlayer);
-    this.isHostReady = true;
-    console.log('[DEBUG] HOST READY', this.peer.id);
-    this.bus.emit('network:ready', { role: 'host', peerId: this.peer.id });
+    this.bus.emit('network:status', 'Создаём Firebase лобби...');
+    await this.prepareLocalPlayer(true);
+    const { lobbyId, hostId } = await this.firebaseLobby.createLobby(this.localPlayer);
+    this.lobbyId = lobbyId;
+    this.hostId = hostId;
+    this.players.set(this.localPlayerId, this.localPlayer);
+    this.bindLobbySnapshots();
+    this.webrtc.configure({ role: 'host', lobbyId, localPlayerId: this.localPlayerId, hostId });
+    await this.webrtc.startHost();
+    this.bus.emit('network:ready', { role: 'host', peerId: lobbyId, lobbyId });
     this.bus.emit('network:status', 'Лобби готово');
     this.bus.emit('players:update', this.getPlayers());
-    console.log('[network] Host mode started', this.peer.id);
+    console.log('[LOBBY] host ready', lobbyId);
   }
 
-  async join(hostId) {
-    this.closeExistingPeer();
+  async join(lobbyId) {
+    this.close(false);
     this.role = 'client';
-    this.hostId = hostId;
-    this.clientReconnectAttempts = 0;
-    await this.openPeerWithRetry('guest');
-    this.localPlayer = { ...this.localPlayer, id: this.peer.id, isHost: false, mic: false, connected: true };
-    const conn = await this.connectToHost(hostId);
-    await this.pingHost(conn);
-    conn.send({ type: 'HELLO', player: this.localPlayer });
-    console.log('[DEBUG] HELLO sent', hostId);
-    await this.waitForStateSync();
-    this.bus.emit('network:ready', { role: 'client', peerId: this.peer.id });
-    console.log('[DEBUG] CLIENT CONNECTED', this.peer.id, 'connected to', hostId);
+    this.bus.emit('network:status', 'Ищем лобби в Firestore...');
+    await this.prepareLocalPlayer(false);
+    const joined = await this.firebaseLobby.joinLobby(lobbyId, this.localPlayer);
+    this.lobbyId = joined.lobbyId;
+    this.hostId = joined.hostId;
+    this.bindLobbySnapshots();
+    this.webrtc.configure({ role: 'client', lobbyId: this.lobbyId, localPlayerId: this.localPlayerId, hostId: this.hostId });
+    await this.webrtc.connectAsGuest();
+    const stateSync = this.waitForStateSync();
+    this.send({ type: 'HELLO', player: this.localPlayer });
+    console.log('[DATA_CHANNEL] HELLO sent', this.hostId);
+    await stateSync;
+    this.bus.emit('network:ready', { role: 'client', peerId: this.lobbyId, lobbyId: this.lobbyId });
+    this.bus.emit('network:status', 'Подключено к Firebase/WebRTC лобби.');
+    console.log('[LOBBY] client joined', this.lobbyId);
   }
 
-  async openPeerWithRetry(rolePrefix, maxAttempts = 4) {
-    let lastError = null;
-    let peerId = this.generatePeerId(rolePrefix);
-    this.isOpening = true;
-    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-      this.peer = this.createPeer(peerId);
-      this.bindPeerEvents();
-      try {
-        await this.waitOpen();
-        console.log('[DEBUG] Peer open', peerId);
-        this.isOpening = false;
-        return;
-      } catch (error) {
-        lastError = error;
-        const type = error?.type || error?.name;
-        console.log('[DEBUG] Peer error', error);
-        console.log(`[network] Peer open attempt ${attempt} failed for ${peerId}`, error);
-        this.isClosingPeer = true;
-        if (this.peer && !this.peer.destroyed && typeof this.peer.destroy === 'function') this.peer.destroy();
-        setTimeout(() => { this.isClosingPeer = false; }, 0);
-        this.peer = null;
-        if (!this.isRetryableOpenError(error) || attempt === maxAttempts) break;
-        if (type === 'unavailable-id') {
-          peerId = this.generatePeerId(rolePrefix);
-          this.bus.emit('network:status', `Peer ID занят, пробуем новый ID ${attempt + 1}/${maxAttempts}…`);
-        } else {
-          this.bus.emit('network:status', `PeerJS Cloud не открыл соединение, повторяем тот же Peer ID ${attempt + 1}/${maxAttempts}…`);
-        }
-        await sleep(650 * attempt);
-      }
-    }
-    this.isOpening = false;
-    if (isPeerCloudUnavailable(lastError)) throw new Error(peerCloudUnavailableMessage(lastError));
-    throw lastError || new Error('PeerJS open failed');
+  bindLobbySnapshots() {
+    this.firebaseLobby.subscribeLobby(this.lobbyId, (lobby) => {
+      console.log('[FIREBASE] lobby snapshot', lobby.status);
+      if (lobby.status === 'closed') this.bus.emit('network:error', 'Лобби закрыто host-игроком.');
+    }, (players) => {
+      this.players = new Map(players.map(player => [player.id, player]));
+      this.bus.emit('players:update', this.getPlayers());
+    }, (error) => this.bus.emit('network:error', formatFirebaseError(error)));
   }
 
-  isRetryableOpenError(error) {
-    return ['Error', 'server-error', 'network', 'socket-error', 'socket-closed', 'unavailable-id'].includes(error?.type || error?.name);
-  }
-
-  generatePeerId(rolePrefix) {
-    const random = uid().replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 10);
-    return `banana-${rolePrefix}-${random}`;
-  }
-
-  createPeer(peerId) {
-    if (!window.Peer) {
-      throw new Error('PeerJS не загрузился. Проверьте интернет, доступ к CDN unpkg.com или подключите библиотеку локально.');
-    }
-    if (location.protocol === 'file:') {
-      console.warn('[network] App is opened via file://; PeerJS/WebRTC can be unstable. Use a local http server or GitHub Pages.');
-    }
-    // Empty host means PeerJS Cloud. Fill PEER_CONFIG.host later to use a self-hosted PeerServer.
-    const options = PEER_CONFIG.host ? PEER_CONFIG : (({ host, port, path, secure, ...cloudConfig }) => cloudConfig)(PEER_CONFIG);
-    return new Peer(peerId, options);
-  }
-
-  closeExistingPeer() {
-    this.isClosingPeer = true;
-    this.stopClientReconnect();
-    this.pendingPings.forEach(({ reject, timer }) => {
-      clearTimeout(timer);
-      reject(new Error('Peer connection closed.'));
-    });
-    this.pendingPings.clear();
-    if (this.pendingStateSync) {
-      clearTimeout(this.pendingStateSync.timer);
-      this.pendingStateSync.reject(new Error('Peer connection closed before STATE_SYNC.'));
-      this.pendingStateSync = null;
-    }
-    this.connections.forEach(conn => conn.close());
-    this.connections.clear();
-    if (this.peer && !this.peer.destroyed && typeof this.peer.destroy === 'function') this.peer.destroy();
-    this.peer = null;
-    this.players.clear();
-    this.isHostReady = false;
-    setTimeout(() => { this.isClosingPeer = false; }, 0);
-  }
-
-  bindPeerEvents() {
-    this.peer.on('connection', (conn) => this.registerConnection(conn));
-    this.peer.on('call', (call) => this.bus.emit('voice:incoming-call', call));
-    this.peer.on('disconnected', () => this.handlePeerDisconnected('disconnected'));
-    this.peer.on('close', () => {
-      if (!this.isClosingPeer && this.role === 'client') this.scheduleClientReconnect();
-      this.bus.emit('network:status', 'Соединение закрыто.');
-    });
-    this.peer.on('error', (error) => {
-      console.log('[DEBUG] Peer error', error);
-      console.log('[network] PeerJS error', error);
-      const type = error?.type || error?.name;
-      if (this.role === 'host' && ['network', 'socket-error', 'socket-closed', 'disconnected'].includes(type)) this.reconnectHost();
-      if (!this.isOpening) this.bus.emit('network:error', isPeerCloudUnavailable(error) ? peerCloudUnavailableMessage(error) : formatPeerError(error));
-    });
-    this.peer.on('open', (id) => {
-      console.log('[DEBUG] Peer open', id || this.peer.id);
-      if (this.isReconnectingHost) {
-        this.isReconnectingHost = false;
-        this.isHostReady = true;
-        console.log('[DEBUG] RECONNECT SUCCESS', this.peer.id);
-        this.bus.emit('network:status', 'Лобби восстановлено');
-      }
-    });
-  }
-
-  waitOpen() {
-    return new Promise((resolve, reject) => {
-      this.peer.on('open', resolve);
-      this.peer.on('error', reject);
-    });
-  }
-
-  waitConnectionOpen(conn, hostId, timeoutMs = PING_TIMEOUT_MS) {
-    return new Promise((resolve, reject) => {
-      const snapshot = { exists: () => Boolean(conn.open) };
-      if (snapshot.exists()) {
-        console.log('[DEBUG] DataConnection open', true);
-        resolve();
-        return;
-      }
-      let settled = false;
-      const finish = (callback, value) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        console.log('[DEBUG] DataConnection open', snapshot.exists());
-        callback(value);
-      };
-      const timer = setTimeout(() => {
-        finish(reject, new Error('Хост не отвечает. Возможно он закрыл вкладку или потерял соединение.'));
-      }, timeoutMs);
-      conn.on('open', () => finish(resolve));
-      conn.on('error', (error) => finish(reject, error));
-      conn.on('close', () => finish(reject, new Error('Хост недоступен или уже закрыл лобби')));
-    });
-  }
-
-
-  connectToHost(hostId) {
-    console.log('[DEBUG] CLIENT CONNECTING', hostId);
-    console.log('[DEBUG] Joining room...');
-    const conn = this.peer.connect(hostId, { reliable: true, metadata: { player: this.localPlayer } });
-    this.registerConnection(conn);
-    return this.waitConnectionOpen(conn, hostId).then(() => {
-      console.log('[DEBUG] Peer connected', hostId);
-      return conn;
-    });
-  }
-
-  pingHost(conn, timeoutMs = PING_TIMEOUT_MS) {
-    return new Promise((resolve, reject) => {
-      const pingId = uid();
-      const timer = setTimeout(() => {
-        this.pendingPings.delete(pingId);
-        reject(new Error('Хост недоступен или уже закрыл лобби.'));
-      }, timeoutMs);
-      this.pendingPings.set(pingId, {
-        resolve: () => {
-          clearTimeout(timer);
-          this.pendingPings.delete(pingId);
-          console.log('[DEBUG] PONG RECEIVED', conn.peer);
-          resolve();
-        },
-        reject,
-        timer,
-      });
-      console.log('[DEBUG] PING SENT', conn.peer);
-      conn.send({ type: 'PING', pingId });
-    });
-  }
-
-  waitForStateSync(timeoutMs = STATE_SYNC_TIMEOUT_MS) {
+  waitForStateSync(timeoutMs = FIRESTORE_STATE_TIMEOUT_MS) {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        console.warn('[DEBUG] STATE_SYNC not received in 5 seconds', this.hostId);
         this.pendingStateSync = null;
-        reject(new Error('Хост не отвечает между HELLO и STATE_SYNC. Возможно host закрыл вкладку, потерял PeerJS-соединение или не обработал HELLO.'));
+        reject(new Error('Host не отправил STATE_SYNC через DataChannel.'));
       }, timeoutMs);
       this.pendingStateSync = { resolve, reject, timer };
     });
   }
 
-  handlePeerDisconnected(reason) {
-    console.log('[DEBUG] RECONNECT START', reason);
-    if (this.role === 'host') {
-      this.reconnectHost();
+  handleDataMessage(from, message) {
+    console.log('[DATA_CHANNEL] received', from, message.type);
+    if (this.role === 'host' && message.type === 'HELLO') {
+      console.log('[LOBBY] HELLO received', from);
+      const stateSync = { type: 'STATE_SYNC', players: this.getPlayers(), hostId: this.lobbyId };
+      this.webrtc.sendTo(from, stateSync);
+      console.log('[DATA_CHANNEL] STATE_SYNC sent', from);
+      this.bus.emit('system', `${message.player?.name || 'Игрок'} подключился к лобби.`);
       return;
-    }
-    if (this.role === 'client') this.scheduleClientReconnect();
-    this.bus.emit('network:status', 'PeerJS disconnected. Пытаемся восстановить соединение…');
-  }
-
-  reconnectHost() {
-    if (!this.peer || this.peer.destroyed || this.isReconnectingHost) return;
-    this.isReconnectingHost = true;
-    this.isHostReady = false;
-    console.log('[DEBUG] RECONNECT START', this.peer.id);
-    this.bus.emit('network:status', 'Восстанавливаем лобби…');
-    try {
-      this.peer.reconnect();
-    } catch (error) {
-      this.isReconnectingHost = false;
-      console.log('[DEBUG] RECONNECT FAILED', error);
-      console.log('[DEBUG] Peer error', error);
-      this.bus.emit('network:error', isPeerCloudUnavailable(error) ? peerCloudUnavailableMessage(error) : formatPeerError(error));
-    }
-  }
-
-  stopClientReconnect() {
-    if (this.clientReconnectTimer) clearTimeout(this.clientReconnectTimer);
-    this.clientReconnectTimer = null;
-  }
-
-  scheduleClientReconnect() {
-    if (this.role !== 'client' || !this.hostId || this.clientReconnectTimer || this.isClosingPeer) return;
-    if (this.clientReconnectAttempts >= CLIENT_RECONNECT_MAX_ATTEMPTS) {
-      console.log('[DEBUG] RECONNECT FAILED', this.hostId);
-      this.bus.emit('network:error', 'Хост не отвечает. Возможно он закрыл вкладку или потерял соединение.');
-      return;
-    }
-    this.clientReconnectAttempts += 1;
-    console.log('[DEBUG] RECONNECT START', `${this.clientReconnectAttempts}/${CLIENT_RECONNECT_MAX_ATTEMPTS}`, this.hostId);
-    this.bus.emit('network:status', `Переподключаемся к лобби… ${this.clientReconnectAttempts}/${CLIENT_RECONNECT_MAX_ATTEMPTS}`);
-    this.clientReconnectTimer = setTimeout(async () => {
-      this.clientReconnectTimer = null;
-      try {
-        if (!this.peer || this.peer.destroyed) await this.openPeerWithRetry('guest');
-        else if (this.peer.disconnected && typeof this.peer.reconnect === 'function') {
-          this.peer.reconnect();
-          await Promise.race([
-            this.waitOpen(),
-            sleep(5000).then(() => { throw new Error('PeerJS reconnect timeout'); }),
-          ]);
-        }
-        const conn = await this.connectToHost(this.hostId);
-        await this.pingHost(conn);
-        conn.send({ type: 'HELLO', player: this.localPlayer });
-        console.log('[DEBUG] HELLO sent', this.hostId);
-        await this.waitForStateSync();
-        this.clientReconnectAttempts = 0;
-        console.log('[DEBUG] RECONNECT SUCCESS', this.hostId);
-        this.bus.emit('network:status', 'Подключение к лобби восстановлено.');
-      } catch (error) {
-        console.log('[DEBUG] RECONNECT FAILED', error);
-        this.scheduleClientReconnect();
-      }
-    }, CLIENT_RECONNECT_INTERVAL_MS);
-  }
-
-  registerConnection(conn) {
-    conn.on('open', () => {
-      this.connections.set(conn.peer, conn);
-      console.log('[DEBUG] Peer connected', conn.peer);
-      console.log('[network] data connection open', conn.peer);
-      if (this.role === 'client') console.log('[DEBUG] CLIENT CONNECTED', conn.peer);
-      if (this.role === 'host') {
-        setTimeout(() => {
-          if (this.connections.has(conn.peer) && !this.players.has(conn.peer)) {
-            console.warn('[DEBUG] HELLO not received in 5 seconds', conn.peer);
-          }
-        }, STATE_SYNC_TIMEOUT_MS);
-      }
-      this.bus.emit('network:connection-open', conn.peer);
-    });
-    conn.on('data', (message) => this.handleMessage(conn.peer, message));
-    conn.on('close', () => {
-      console.log('[DEBUG] Connection closed', conn.peer);
-      this.handleClose(conn.peer);
-    });
-    conn.on('error', (error) => {
-      const type = error?.type || error?.name;
-      if (this.role === 'client' && ['peer-unavailable', 'network', 'socket-closed', 'disconnected'].includes(type)) this.scheduleClientReconnect();
-      console.log('[DEBUG] Peer error', error);
-      this.bus.emit('network:error', isPeerCloudUnavailable(error) ? peerCloudUnavailableMessage(error) : formatPeerError(error));
-    });
-  }
-
-  handleMessage(from, message) {
-    console.log('[network] message', from, message.type);
-    if (message.type === 'PING') {
-      if (this.role === 'host' && this.isHostReady) {
-        this.connections.get(from)?.send({ type: 'PONG', pingId: message.pingId });
-      }
-      return;
-    }
-    if (message.type === 'PONG') {
-      this.pendingPings.get(message.pingId)?.resolve();
-      return;
-    }
-    if (this.role === 'host') {
-      if (message.type === 'HELLO') {
-        console.log('[DEBUG] HELLO received', from);
-        const player = message.player || { id: from, name: 'Игрок', avatar: '🜁' };
-        if (this.players.size >= MAX_PLAYERS && !this.players.has(from)) {
-          this.connections.get(from)?.send({ type: 'LOBBY_FULL' });
-          this.connections.get(from)?.close();
-          return;
-        }
-        this.players.set(from, { ...player, id: from, isHost: false, connected: true });
-        this.broadcast({ type: 'STATE_SYNC', players: this.getPlayers(), hostId: this.hostId }, true);
-        console.log('[DEBUG] STATE_SYNC sent', from);
-        this.bus.emit('players:update', this.getPlayers());
-        this.bus.emit('system', `${player.name} подключился к лобби.`);
-        return;
-      }
-      // Host is authoritative router: every lobby, chat and game event is rebroadcast to all clients.
-      if (['CHAT', 'GAME_PROPOSAL', 'GAME_EVENT', 'MIC_STATUS'].includes(message.type)) this.broadcast({ ...message, from }, true);
     }
     if (message.type === 'STATE_SYNC') {
-      console.log('[DEBUG] STATE_SYNC received', from);
-      this.players = new Map(message.players.map(p => [p.id, p]));
-      this.hostId = message.hostId;
-      this.bus.emit('players:update', this.getPlayers());
-      this.bus.emit('network:status', 'Подключено к Banana Play лобби.');
+      console.log('[DATA_CHANNEL] STATE_SYNC received', from);
+      if (Array.isArray(message.players)) this.players = new Map(message.players.map(player => [player.id, player]));
       if (this.pendingStateSync) {
         clearTimeout(this.pendingStateSync.timer);
         this.pendingStateSync.resolve();
         this.pendingStateSync = null;
       }
+      this.bus.emit('players:update', this.getPlayers());
+      return;
     }
-    if (message.type === 'LOBBY_FULL') this.bus.emit('network:error', 'Лобби заполнено: максимум 3 игрока.');
+    if (this.role === 'host' && ['CHAT', 'GAME_PROPOSAL', 'GAME_EVENT', 'MIC_STATUS', 'START_GAME', 'PROPOSAL_REJECTED'].includes(message.type)) {
+      this.broadcast({ ...message, from }, true);
+      return;
+    }
     this.bus.emit('network:message', { from, message });
   }
 
-  handleClose(peerId) {
-    this.connections.delete(peerId);
-    const player = this.players.get(peerId);
-    if (this.role === 'host' && player) {
-      this.players.delete(peerId);
-      this.broadcast({ type: 'STATE_SYNC', players: this.getPlayers(), hostId: this.hostId }, true);
-      this.bus.emit('players:update', this.getPlayers());
-      this.bus.emit('system', `${player.name} отключился.`);
-    }
-    if (this.role === 'client' && peerId === this.hostId && !this.isClosingPeer) this.scheduleClientReconnect();
-  }
-
   send(message) {
-    if (this.role === 'host') this.broadcast({ ...message, from: this.peer.id }, true);
-    else {
-      const conn = this.connections.get(this.hostId);
-      if (conn?.open) conn.send(message);
-      else this.scheduleClientReconnect();
-    }
+    if (this.role === 'host') this.broadcast({ ...message, from: this.localPlayerId }, true);
+    else this.webrtc.sendTo(this.hostId, message);
   }
 
   broadcast(message, includeSelf = false) {
-    this.connections.forEach((conn) => conn.open && conn.send(message));
-    if (includeSelf) this.bus.emit('network:message', { from: this.peer?.id, message });
+    this.webrtc.broadcast(message);
+    if (includeSelf) this.bus.emit('network:message', { from: this.localPlayerId, message });
   }
 
-  updateMicStatus(enabled) {
-    if (!this.localPlayer?.id) return;
+  async updateMicStatus(enabled) {
+    if (!this.localPlayerId || !this.lobbyId) return;
     this.localPlayer.mic = enabled;
-    if (this.players.has(this.localPlayer.id)) this.players.set(this.localPlayer.id, { ...this.players.get(this.localPlayer.id), mic: enabled });
-    this.send({ type: 'MIC_STATUS', playerId: this.localPlayer.id, enabled });
+    if (this.players.has(this.localPlayerId)) this.players.set(this.localPlayerId, { ...this.players.get(this.localPlayerId), mic: enabled });
+    await this.firebaseLobby.updatePlayer(this.lobbyId, this.localPlayerId, { micEnabled: enabled }).catch(error => this.bus.emit('network:error', formatFirebaseError(error)));
+    this.send({ type: 'MIC_STATUS', playerId: this.localPlayerId, enabled });
     this.bus.emit('players:update', this.getPlayers());
   }
 
+  setLocalStream(stream) { this.webrtc.setLocalStream(stream); }
   getPlayers() { return [...this.players.values()]; }
+
+  close(markOffline = true) {
+    this.webrtc.close();
+    this.firebaseLobby.cleanup();
+    if (markOffline && this.lobbyId && this.localPlayerId) {
+      if (this.role === 'host') this.firebaseLobby.closeLobby(this.lobbyId);
+      else this.firebaseLobby.setOffline(this.lobbyId, this.localPlayerId);
+    }
+    this.connections.clear();
+    this.players.clear();
+    this.pendingStateSync = null;
+  }
 }
 
 class VoiceManager {
@@ -562,18 +662,18 @@ class VoiceManager {
     document.addEventListener('keydown', (event) => {
       if (event.key.toLowerCase() === 'm' && !['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName)) this.toggle();
     });
-    this.bus.on('voice:incoming-call', (call) => this.answerCall(call));
-    this.bus.on('network:connection-open', () => this.callPeers());
+    this.bus.on('voice:remote-stream', ({ peerId, stream }) => this.mountRemote(peerId, stream));
+    this.bus.on('network:connection-open', () => { if (this.stream) this.network.setLocalStream(this.stream); });
     this.paint();
   }
 
   async ensureStream() {
     if (this.stream) return this.stream;
-    // Voice is pure WebRTC: getUserMedia creates one local stream, PeerJS transports it as media calls.
+    console.log('[WEBRTC] getUserMedia audio');
     this.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true }, video: false });
     this.stream.getAudioTracks().forEach(track => track.enabled = this.enabled);
+    this.network.setLocalStream(this.stream);
     this.setupMeter();
-    this.callPeers();
     return this.stream;
   }
 
@@ -589,25 +689,11 @@ class VoiceManager {
     }
   }
 
-  async answerCall(call) {
-    const stream = await this.ensureStream().catch(() => null);
-    if (stream) call.answer(stream);
-    call.on('stream', remoteStream => this.mountRemote(call.peer, remoteStream));
-  }
-
-  callPeers() {
-    if (!this.stream || !this.network.peer || typeof this.network.peer.call !== 'function') return;
-    this.network.connections.forEach((_, peerId) => {
-      const call = this.network.peer.call(peerId, this.stream);
-      call?.on('stream', remoteStream => this.mountRemote(peerId, remoteStream));
-    });
-  }
-
   mountRemote(peerId, stream) {
-    let audio = document.querySelector(`audio[data-peer="${peerId}"]`);
+    let audio = document.querySelector(`audio[data-participant="${peerId}"]`);
     if (!audio) {
       audio = document.createElement('audio');
-      audio.dataset.peer = peerId;
+      audio.dataset.participant = peerId;
       audio.autoplay = true;
       audio.playsInline = true;
       $('#remoteAudioMount').append(audio);
@@ -640,6 +726,7 @@ class VoiceManager {
   }
 }
 
+
 class LobbyApp {
   constructor() {
     this.bus = new EventBus();
@@ -667,12 +754,12 @@ class LobbyApp {
     });
     $('#confirmHostBtn').addEventListener('click', (event) => { event.preventDefault(); this.createLobbyWithPassword(); });
     $('#joinLobbyBtn').addEventListener('click', () => this.joinLobby());
-    $('#peerIdInput').addEventListener('keydown', (event) => {
+    $('#lobbyIdInput').addEventListener('keydown', (event) => {
       if (event.key === 'Enter') this.joinLobby();
     });
-    $('#copyPeerBtn').addEventListener('click', async () => {
-      await navigator.clipboard.writeText(this.network.peer?.id || '');
-      this.chat.system('Peer ID скопирован в буфер обмена.');
+    $('#copyLobbyBtn').addEventListener('click', async () => {
+      await navigator.clipboard.writeText(this.network.lobbyId || '');
+      this.chat.system('код лобби скопирован в буфер обмена.');
     });
     $('#backToCatalogBtn').addEventListener('click', () => this.showCatalog());
   }
@@ -680,25 +767,25 @@ class LobbyApp {
   bindEvents() {
     this.bus.on('system', (text) => this.chat.system(text));
     this.bus.on('chat:send', ({ text }) => {
-      const message = { type: 'CHAT', id: uid(), author: this.profile.name, authorId: this.network.peer?.id || 'local', text, time: now() };
+      const message = { type: 'CHAT', id: uid(), author: this.profile.name, authorId: this.network.localPlayerId || 'local', text, time: now() };
       this.network.send(message);
       if (this.network.role === 'offline') this.chat.add({ ...message, kind: 'own' });
     });
     this.bus.on('network:preparing-host', () => {
-      $('#ownPeerBox').classList.add('hidden');
-      $('#copyPeerBtn').textContent = '';
+      $('#ownLobbyBox').classList.add('hidden');
+      $('#copyLobbyBtn').textContent = '';
       $('#roleBadge').textContent = 'preparing';
       $('#roleBadge').className = 'badge warning';
     });
-    this.bus.on('network:ready', ({ role, peerId }) => {
+    this.bus.on('network:ready', ({ role, lobbyId }) => {
       $('#roleBadge').textContent = role;
       $('#roleBadge').className = `badge ${role === 'host' ? 'warning' : 'success'}`;
-      $('#ownPeerBox').classList.remove('hidden');
-      $('#copyPeerBtn').textContent = peerId;
-      $('#connectionStatus').textContent = role === 'host' ? 'Лобби создано · поделитесь Peer ID' : 'Соединение открыто · ждём состояние лобби…';
+      $('#ownLobbyBox').classList.remove('hidden');
+      $('#copyLobbyBtn').textContent = lobbyId;
+      $('#connectionStatus').textContent = role === 'host' ? 'Лобби создано · поделитесь код лобби' : 'WebRTC соединение открыто · ждём состояние лобби…';
       $('#chatStatus').textContent = 'online';
       $('#chatStatus').className = 'badge success';
-      this.chat.system(role === 'host' ? 'Вы создали Banana Play лобби как host.' : 'Вы подключаетесь к Banana Play host-лобби.');
+      this.chat.system(role === 'host' ? 'Вы создали Banana Play лобби как host.' : 'Вы подключаетесь к Banana Play лобби.');
     });
     this.bus.on('network:status', (text) => { $('#connectionStatus').textContent = text; });
     this.bus.on('network:error', (text) => {
@@ -712,7 +799,7 @@ class LobbyApp {
   }
 
   routeMessage(message) {
-    if (message.type === 'CHAT') this.chat.add({ ...message, kind: message.authorId === this.network.peer?.id ? 'own' : '' });
+    if (message.type === 'CHAT') this.chat.add({ ...message, kind: message.authorId === this.network.localPlayerId ? 'own' : '' });
     if (message.type === 'MIC_STATUS') {
       const player = this.network.players.get(message.playerId);
       if (player) this.network.players.set(message.playerId, { ...player, mic: message.enabled });
@@ -754,7 +841,7 @@ class LobbyApp {
     this.network.setLocalPlayer({ name, avatar: this.profile.avatar });
     $('#onboarding').classList.remove('is-active');
     $('#lobby').classList.add('is-active');
-    this.chat.system(`Профиль ${name} готов. Создайте лобби или подключитесь по Peer ID.`);
+    this.chat.system(`Профиль ${name} готов. Создайте лобби или подключитесь по коду лобби.`);
   }
   renderAvatars() {
     $('#avatarGrid').innerHTML = AVATARS.map(a => `<button class="avatar-option ${a === this.profile.avatar ? 'is-selected' : ''}" data-avatar="${a}" role="radio" aria-checked="${a === this.profile.avatar}">${a}</button>`).join('');
@@ -785,27 +872,27 @@ class LobbyApp {
     try {
       $('#connectionStatus').textContent = 'Создаём Banana Play лобби…';
       await this.network.startHost();
-      console.log('[DEBUG] Peer lobby created', this.network.peer?.id);
+      console.log('[LOBBY] Firebase lobby created', this.network.lobbyId);
     } catch (error) {
       console.log('[network] Host start failed', error);
-      console.log('[DEBUG] Peer error', error);
-      this.bus.emit('network:error', isPeerCloudUnavailable(error) ? peerCloudUnavailableMessage(error) : formatPeerError(error));
+      console.log('[FIREBASE] error', error);
+      this.bus.emit('network:error', formatFirebaseError(error));
     }
   }
 
   async joinLobby() {
     console.log('[DEBUG] joinLobby clicked');
-    const hostId = $('#peerIdInput').value.trim();
-    console.log('[DEBUG] roomId =', hostId);
-    if (!hostId) return this.chat.system('Введите Peer ID существующего host-лобби.');
+    const lobbyId = $('#lobbyIdInput').value.trim().toUpperCase();
+    console.log('[LOBBY] lobbyId =', lobbyId);
+    if (!lobbyId) return this.chat.system('Введите код существующего лобби.');
     this.network.setLocalPlayer({ name: this.profile.name || 'Игрок', avatar: this.profile.avatar });
     try {
       $('#connectionStatus').textContent = 'Подключаемся к Banana Play лобби…';
-      await this.network.join(hostId);
+      await this.network.join(lobbyId);
     } catch (error) {
       console.log('[network] Join failed', error);
-      console.log('[DEBUG] Peer error', error);
-      this.bus.emit('network:error', isPeerCloudUnavailable(error) ? peerCloudUnavailableMessage(error) : formatPeerError(error));
+      console.log('[FIREBASE] error', error);
+      this.bus.emit('network:error', formatFirebaseError(error));
     }
   }
 
@@ -820,7 +907,7 @@ class LobbyApp {
       node.classList.toggle('is-host', player.isHost);
       node.querySelector('.avatar').textContent = player.avatar;
       node.querySelector('strong').textContent = player.name;
-      node.querySelector('.player-meta span').textContent = player.id === this.network.peer?.id ? 'это вы' : player.id;
+      node.querySelector('.player-meta span').textContent = player.id === this.network.localPlayerId ? 'это вы' : player.id;
       node.querySelector('.player-flags').innerHTML = `${player.isHost ? '<span class="flag host">host</span>' : ''}<span class="flag ${player.mic ? 'mic-on' : 'mic-off'}">${player.mic ? 'mic' : 'mute'}</span>`;
       list.append(node);
     });
@@ -850,7 +937,7 @@ class LobbyApp {
 
   proposeGame(gameId) {
     if (this.network.role === 'offline') return this.chat.system('Сначала создайте или подключитесь к лобби.');
-    const proposal = { type: 'GAME_PROPOSAL', id: uid(), gameId, proposer: this.profile.name, proposerId: this.network.peer.id };
+    const proposal = { type: 'GAME_PROPOSAL', id: uid(), gameId, proposer: this.profile.name, proposerId: this.network.localPlayerId };
     this.network.send(proposal);
     this.chat.system(`Предложена игра «${this.gameTitle(gameId)}». Host должен подтвердить запуск.`);
   }
@@ -891,9 +978,9 @@ class LobbyApp {
     $('#backToCatalogBtn').classList.remove('hidden');
     $('#stageTitle').textContent = this.gameTitle(gameId);
     const context = {
-      localPlayerId: this.network.peer?.id || 'local',
+      localPlayerId: this.network.localPlayerId || 'local',
       players: this.network.getPlayers(),
-      sendGameEvent: (payload) => this.network.send({ type: 'GAME_EVENT', gameId, payload, actorId: this.network.peer?.id }),
+      sendGameEvent: (payload) => this.network.send({ type: 'GAME_EVENT', gameId, payload, actorId: this.network.localPlayerId }),
       system: (text) => this.chat.system(text),
     };
     this.currentGame.init($('#gameContainer'), context, initialState);

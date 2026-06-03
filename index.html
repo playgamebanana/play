@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="description" content="Banana Play: яркий P2P игровой хаб для 2–3 игроков с лобби, чатом, голосом и мини-играми без backend-сервера." />
   <title>Banana Play — P2P игровой хаб</title>
-  <link rel="preconnect" href="https://unpkg.com" />
+  <link rel="preconnect" href="https://www.gstatic.com" />
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -17,9 +17,9 @@
     <section id="onboarding" class="screen onboarding-screen is-active" aria-label="Создание профиля">
       <div class="brand-card glass-panel">
         <div class="brand-mark">🍌</div>
-        <p class="eyebrow">browser only · peer-to-peer · friends table</p>
+        <p class="eyebrow">Firebase · WebRTC · friends table</p>
         <h1>Banana Play</h1>
-        <p class="hero-copy">Сочный многопользовательский хаб для настольных и быстрых игр. Без сервера: только браузер, PeerJS и WebRTC.</p>
+        <p class="hero-copy">Сочный многопользовательский хаб для настольных и быстрых игр. Без собственного сервера: Firebase Firestore для сигналинга и чистый WebRTC для связи.</p>
         <div class="hero-stats">
           <span>2–3 игрока</span>
           <span>чат</span>
@@ -83,16 +83,16 @@
 
           <button id="openHostModalBtn" class="btn btn-primary btn-wide">Создать лобби</button>
           <div class="divider"><span>или</span></div>
-          <label class="field-label" for="peerIdInput">Peer ID хоста</label>
+          <label class="field-label" for="lobbyIdInput">Код лобби</label>
           <div class="inline-form">
-            <input id="peerIdInput" class="input" type="text" placeholder="host-peer-id" />
+            <input id="lobbyIdInput" class="input" type="text" placeholder="ABCDE" />
             <button id="joinLobbyBtn" class="btn btn-secondary">Войти</button>
           </div>
-          <div id="ownPeerBox" class="peer-box hidden">
-            <span>Ваш Peer ID</span>
-            <button id="copyPeerBtn" class="copy-id" title="Скопировать Peer ID"></button>
+          <div id="ownLobbyBox" class="lobby-box hidden">
+            <span>Код лобби</span>
+            <button id="copyLobbyBtn" class="copy-code" title="Скопировать код лобби"></button>
           </div>
-          <p id="networkHint" class="hint">Создавать лобби может только владелец приложения. Остальные игроки подключаются по Peer ID.</p>
+          <p id="networkHint" class="hint">Создавать лобби может только владелец приложения. Остальные игроки подключаются по коду лобби.</p>
         </section>
 
         <section class="panel-section players-panel">
@@ -156,7 +156,7 @@
       <button class="modal-close" value="cancel" aria-label="Закрыть">×</button>
       <p class="eyebrow accent">host only</p>
       <h2>Пароль владельца</h2>
-      <p class="muted">Лобби может создать только владелец приложения. После верного пароля вы станете host и получите Peer ID.</p>
+      <p class="muted">Лобби может создать только владелец приложения. После верного пароля вы станете host и получите код лобби.</p>
       <label class="field-label" for="hostPasswordInput">Пароль</label>
       <input id="hostPasswordInput" class="input" type="password" placeholder="Введите пароль" autocomplete="current-password" />
       <p id="passwordError" class="error-text hidden">Неверный пароль. Создание лобби заблокировано.</p>
@@ -178,7 +178,6 @@
     </article>
   </template>
 
-  <script src="https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js" onerror="this.onerror=null;this.src='https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js'"></script>
   <script type="module" src="main.js"></script>
 </body>
 </html>

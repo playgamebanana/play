@@ -33,11 +33,11 @@ function formatPeerError(error) {
     disconnected: 'PeerJS-сервер временно недоступен или соединение оборвалось. Проверьте интернет и попробуйте ещё раз.',
     'invalid-id': 'Некорректный Peer ID. Проверьте ID хоста и повторите подключение.',
     'invalid-key': 'PeerJS cloud отклонил ключ подключения. Попробуйте обновить страницу.',
-    network: 'Не удалось подключиться к PeerJS-серверу. Откройте сайт через http:// или https://, проверьте интернет/VPN/блокировщики и попробуйте снова.',
+    network: 'PeerJS Cloud недоступен из этой сети. Проверьте блокировку WebSocket, корпоративный firewall, провайдера, DNS/VPN или используйте собственный PeerServer.',
     'peer-unavailable': 'Лобби не найдено. Проверьте Peer ID или попросите host пересоздать лобби.',
     'server-error': 'PeerJS Cloud сейчас недоступен из вашей сети или временно отвечает ошибкой. Приложение уже повторило подключение; попробуйте обновить страницу, отключить VPN/proxy/блокировщик или открыть сайт в другой сети.',
-    'socket-error': 'WebSocket до PeerJS-сервера не открылся. Проверьте сеть, VPN, proxy или блокировщики.',
-    'socket-closed': 'WebSocket до PeerJS-сервера закрылся. Попробуйте переподключиться.',
+    'socket-error': 'WebSocket до PeerJS Cloud не открылся. Сеть, провайдер, firewall, proxy или расширение могут блокировать PeerJS Cloud.',
+    'socket-closed': 'WebSocket до PeerJS Cloud закрылся. Соединение с брокером недоступно или нестабильно.',
     'ssl-unavailable': 'Защищённое соединение с PeerJS-сервером недоступно. Откройте сайт через https://.',
     'unavailable-id': 'Этот Peer ID уже занят. Обновите страницу и попробуйте снова.',
     webrtc: 'WebRTC-соединение не установилось. Проверьте разрешения браузера и сетевые ограничения.',
@@ -47,6 +47,16 @@ function formatPeerError(error) {
   }
   const hint = hints[type] || message || 'Неизвестная ошибка PeerJS. Проверьте интернет, откройте сайт через http(s) и попробуйте обновить страницу.';
   return type && type !== 'Error' && !hint.includes(type) ? `${hint} (${type})` : hint;
+}
+
+
+function isPeerCloudUnavailable(error) {
+  return ['network', 'socket-error', 'socket-closed', 'server-error', 'disconnected'].includes(error?.type || error?.name);
+}
+
+function peerCloudUnavailableMessage(error) {
+  const reason = error?.type || error?.name || 'network';
+  return `PeerJS Cloud недоступен (${reason}). Приложение использует только PeerJS/WebRTC; проверьте WebSocket-блокировки, firewall, DNS, VPN/Proxy или переключите PEER_CONFIG.host на собственный PeerServer.`;
 }
 
 const GAMES = [
@@ -83,16 +93,6 @@ window.addEventListener('error', (event) => {
 window.addEventListener('unhandledrejection', (event) => {
   console.error('[DEBUG] Unhandled promise rejection', event.reason);
 });
-
-function inspectFirebaseState() {
-  const hasFirebase = Boolean(window.firebase);
-  const hasFirebaseConfig = Boolean(window.firebaseConfig || window.__FIREBASE_CONFIG__);
-  if (hasFirebase && hasFirebaseConfig) {
-    console.log('[DEBUG] Firebase initialized');
-  } else {
-    console.log('[DEBUG] Firebase not configured; lobby uses PeerJS/WebRTC only', { hasFirebase, hasFirebaseConfig });
-  }
-}
 
 
 class EventBus extends EventTarget {
@@ -181,7 +181,7 @@ class NetworkManager {
     const conn = await this.connectToHost(hostId);
     await this.pingHost(conn);
     conn.send({ type: 'HELLO', player: this.localPlayer });
-    console.log('[DEBUG] HELLO SENT', hostId);
+    console.log('[DEBUG] HELLO sent', hostId);
     await this.waitForStateSync();
     this.bus.emit('network:ready', { role: 'client', peerId: this.peer.id });
     console.log('[DEBUG] CLIENT CONNECTED', this.peer.id, 'connected to', hostId);
@@ -196,11 +196,13 @@ class NetworkManager {
       this.bindPeerEvents();
       try {
         await this.waitOpen();
+        console.log('[DEBUG] Peer open', peerId);
         this.isOpening = false;
         return;
       } catch (error) {
         lastError = error;
         const type = error?.type || error?.name;
+        console.log('[DEBUG] Peer error', error);
         console.log(`[network] Peer open attempt ${attempt} failed for ${peerId}`, error);
         this.isClosingPeer = true;
         if (this.peer && !this.peer.destroyed && typeof this.peer.destroy === 'function') this.peer.destroy();
@@ -217,6 +219,7 @@ class NetworkManager {
       }
     }
     this.isOpening = false;
+    if (isPeerCloudUnavailable(lastError)) throw new Error(peerCloudUnavailableMessage(lastError));
     throw lastError || new Error('PeerJS open failed');
   }
 
@@ -272,12 +275,14 @@ class NetworkManager {
       this.bus.emit('network:status', 'Соединение закрыто.');
     });
     this.peer.on('error', (error) => {
+      console.log('[DEBUG] Peer error', error);
       console.log('[network] PeerJS error', error);
       const type = error?.type || error?.name;
-      if (this.role === 'host' && ['network', 'socket-closed', 'disconnected'].includes(type)) this.reconnectHost();
-      if (!this.isOpening) this.bus.emit('network:error', formatPeerError(error));
+      if (this.role === 'host' && ['network', 'socket-error', 'socket-closed', 'disconnected'].includes(type)) this.reconnectHost();
+      if (!this.isOpening) this.bus.emit('network:error', isPeerCloudUnavailable(error) ? peerCloudUnavailableMessage(error) : formatPeerError(error));
     });
-    this.peer.on('open', () => {
+    this.peer.on('open', (id) => {
+      console.log('[DEBUG] Peer open', id || this.peer.id);
       if (this.isReconnectingHost) {
         this.isReconnectingHost = false;
         this.isHostReady = true;
@@ -298,7 +303,7 @@ class NetworkManager {
     return new Promise((resolve, reject) => {
       const snapshot = { exists: () => Boolean(conn.open) };
       if (snapshot.exists()) {
-        console.log('[DEBUG] Room snapshot', true);
+        console.log('[DEBUG] DataConnection open', true);
         resolve();
         return;
       }
@@ -307,7 +312,7 @@ class NetworkManager {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        console.log('[DEBUG] Room snapshot', snapshot.exists());
+        console.log('[DEBUG] DataConnection open', snapshot.exists());
         callback(value);
       };
       const timer = setTimeout(() => {
@@ -325,7 +330,10 @@ class NetworkManager {
     console.log('[DEBUG] Joining room...');
     const conn = this.peer.connect(hostId, { reliable: true, metadata: { player: this.localPlayer } });
     this.registerConnection(conn);
-    return this.waitConnectionOpen(conn, hostId).then(() => conn);
+    return this.waitConnectionOpen(conn, hostId).then(() => {
+      console.log('[DEBUG] Peer connected', hostId);
+      return conn;
+    });
   }
 
   pingHost(conn, timeoutMs = PING_TIMEOUT_MS) {
@@ -333,7 +341,7 @@ class NetworkManager {
       const pingId = uid();
       const timer = setTimeout(() => {
         this.pendingPings.delete(pingId);
-        reject(new Error('Хост недоступен или уже закрыл лобби'));
+        reject(new Error('Хост недоступен или уже закрыл лобби.'));
       }, timeoutMs);
       this.pendingPings.set(pingId, {
         resolve: () => {
@@ -355,7 +363,7 @@ class NetworkManager {
       const timer = setTimeout(() => {
         console.warn('[DEBUG] STATE_SYNC not received in 5 seconds', this.hostId);
         this.pendingStateSync = null;
-        reject(new Error('Хост не отвечает. Возможно он закрыл вкладку или потерял соединение.'));
+        reject(new Error('Хост не отвечает между HELLO и STATE_SYNC. Возможно host закрыл вкладку, потерял PeerJS-соединение или не обработал HELLO.'));
       }, timeoutMs);
       this.pendingStateSync = { resolve, reject, timer };
     });
@@ -382,7 +390,8 @@ class NetworkManager {
     } catch (error) {
       this.isReconnectingHost = false;
       console.log('[DEBUG] RECONNECT FAILED', error);
-      this.bus.emit('network:error', formatPeerError(error));
+      console.log('[DEBUG] Peer error', error);
+      this.bus.emit('network:error', isPeerCloudUnavailable(error) ? peerCloudUnavailableMessage(error) : formatPeerError(error));
     }
   }
 
@@ -415,7 +424,7 @@ class NetworkManager {
         const conn = await this.connectToHost(this.hostId);
         await this.pingHost(conn);
         conn.send({ type: 'HELLO', player: this.localPlayer });
-        console.log('[DEBUG] HELLO SENT', this.hostId);
+        console.log('[DEBUG] HELLO sent', this.hostId);
         await this.waitForStateSync();
         this.clientReconnectAttempts = 0;
         console.log('[DEBUG] RECONNECT SUCCESS', this.hostId);
@@ -430,6 +439,7 @@ class NetworkManager {
   registerConnection(conn) {
     conn.on('open', () => {
       this.connections.set(conn.peer, conn);
+      console.log('[DEBUG] Peer connected', conn.peer);
       console.log('[network] data connection open', conn.peer);
       if (this.role === 'client') console.log('[DEBUG] CLIENT CONNECTED', conn.peer);
       if (this.role === 'host') {
@@ -442,11 +452,15 @@ class NetworkManager {
       this.bus.emit('network:connection-open', conn.peer);
     });
     conn.on('data', (message) => this.handleMessage(conn.peer, message));
-    conn.on('close', () => this.handleClose(conn.peer));
+    conn.on('close', () => {
+      console.log('[DEBUG] Connection closed', conn.peer);
+      this.handleClose(conn.peer);
+    });
     conn.on('error', (error) => {
       const type = error?.type || error?.name;
       if (this.role === 'client' && ['peer-unavailable', 'network', 'socket-closed', 'disconnected'].includes(type)) this.scheduleClientReconnect();
-      this.bus.emit('network:error', formatPeerError(error));
+      console.log('[DEBUG] Peer error', error);
+      this.bus.emit('network:error', isPeerCloudUnavailable(error) ? peerCloudUnavailableMessage(error) : formatPeerError(error));
     });
   }
 
@@ -464,6 +478,7 @@ class NetworkManager {
     }
     if (this.role === 'host') {
       if (message.type === 'HELLO') {
+        console.log('[DEBUG] HELLO received', from);
         const player = message.player || { id: from, name: 'Игрок', avatar: '🜁' };
         if (this.players.size >= MAX_PLAYERS && !this.players.has(from)) {
           this.connections.get(from)?.send({ type: 'LOBBY_FULL' });
@@ -472,6 +487,7 @@ class NetworkManager {
         }
         this.players.set(from, { ...player, id: from, isHost: false, connected: true });
         this.broadcast({ type: 'STATE_SYNC', players: this.getPlayers(), hostId: this.hostId }, true);
+        console.log('[DEBUG] STATE_SYNC sent', from);
         this.bus.emit('players:update', this.getPlayers());
         this.bus.emit('system', `${player.name} подключился к лобби.`);
         return;
@@ -480,6 +496,7 @@ class NetworkManager {
       if (['CHAT', 'GAME_PROPOSAL', 'GAME_EVENT', 'MIC_STATUS'].includes(message.type)) this.broadcast({ ...message, from }, true);
     }
     if (message.type === 'STATE_SYNC') {
+      console.log('[DEBUG] STATE_SYNC received', from);
       this.players = new Map(message.players.map(p => [p.id, p]));
       this.hostId = message.hostId;
       this.bus.emit('players:update', this.getPlayers());
@@ -625,7 +642,6 @@ class VoiceManager {
 
 class LobbyApp {
   constructor() {
-    inspectFirebaseState();
     this.bus = new EventBus();
     this.profile = this.loadProfile();
     this.network = new NetworkManager(this.bus);
@@ -769,11 +785,11 @@ class LobbyApp {
     try {
       $('#connectionStatus').textContent = 'Создаём Banana Play лобби…';
       await this.network.startHost();
-      const roomRef = { id: this.network.peer?.id };
-      console.log('[DEBUG] Room created', roomRef.id);
+      console.log('[DEBUG] Peer lobby created', this.network.peer?.id);
     } catch (error) {
       console.log('[network] Host start failed', error);
-      this.bus.emit('network:error', formatPeerError(error));
+      console.log('[DEBUG] Peer error', error);
+      this.bus.emit('network:error', isPeerCloudUnavailable(error) ? peerCloudUnavailableMessage(error) : formatPeerError(error));
     }
   }
 
@@ -788,7 +804,8 @@ class LobbyApp {
       await this.network.join(hostId);
     } catch (error) {
       console.log('[network] Join failed', error);
-      this.bus.emit('network:error', formatPeerError(error));
+      console.log('[DEBUG] Peer error', error);
+      this.bus.emit('network:error', isPeerCloudUnavailable(error) ? peerCloudUnavailableMessage(error) : formatPeerError(error));
     }
   }
 

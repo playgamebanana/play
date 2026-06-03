@@ -53,12 +53,36 @@ const GAMES = [
   { id: 'kingdom', title: 'Королевство', icon: '👑', status: 'soon', description: 'Большая социальная стратегия в разработке: сейчас доступен визуальный экран.' },
 ];
 
-const $ = (selector) => document.querySelector(selector);
+const $ = (selector) => {
+  const element = document.querySelector(selector);
+  if (!element) {
+    console.error(`[DEBUG] Missing DOM element: ${selector}`);
+  }
+  return element;
+};
 const now = () => new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
 const uid = () => crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2);
 const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
 const escapeHtml = (s='') => s.replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+window.addEventListener('error', (event) => {
+  console.error('[DEBUG] Uncaught error', event.error || event.message);
+});
+
+window.addEventListener('unhandledrejection', (event) => {
+  console.error('[DEBUG] Unhandled promise rejection', event.reason);
+});
+
+function inspectFirebaseState() {
+  const hasFirebase = Boolean(window.firebase);
+  const hasFirebaseConfig = Boolean(window.firebaseConfig || window.__FIREBASE_CONFIG__);
+  if (hasFirebase && hasFirebaseConfig) {
+    console.log('[DEBUG] Firebase initialized');
+  } else {
+    console.log('[DEBUG] Firebase not configured; lobby uses PeerJS/WebRTC only', { hasFirebase, hasFirebaseConfig });
+  }
+}
 
 
 class EventBus extends EventTarget {
@@ -129,10 +153,12 @@ class NetworkManager {
     this.hostId = hostId;
     await this.openPeerWithRetry('guest');
     this.localPlayer = { ...this.localPlayer, id: this.peer.id, isHost: false, mic: false, connected: true };
+    console.log('[DEBUG] Joining room...');
     const conn = this.peer.connect(hostId, { reliable: true, metadata: { player: this.localPlayer } });
     this.registerConnection(conn);
+    await this.waitConnectionOpen(conn, hostId);
     this.bus.emit('network:ready', { role: 'client', peerId: this.peer.id });
-    console.log('[network] Client peer opened', this.peer.id, 'connecting to', hostId);
+    console.log('[network] Client peer opened', this.peer.id, 'connected to', hostId);
   }
 
   async openPeerWithRetry(rolePrefix, maxAttempts = 4) {
@@ -207,6 +233,31 @@ class NetworkManager {
     });
   }
 
+  waitConnectionOpen(conn, hostId, timeoutMs = 12000) {
+    return new Promise((resolve, reject) => {
+      const snapshot = { exists: () => Boolean(conn.open) };
+      if (snapshot.exists()) {
+        console.log('[DEBUG] Room snapshot', true);
+        resolve();
+        return;
+      }
+      let settled = false;
+      const finish = (callback, value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        console.log('[DEBUG] Room snapshot', snapshot.exists());
+        callback(value);
+      };
+      const timer = setTimeout(() => {
+        finish(reject, new Error(`Document does not exist: host lobby ${hostId} was not found or did not answer in time.`));
+      }, timeoutMs);
+      conn.on('open', () => finish(resolve));
+      conn.on('error', (error) => finish(reject, error));
+      conn.on('close', () => finish(reject, new Error(`Document does not exist: host lobby ${hostId} is closed.`)));
+    });
+  }
+
   registerConnection(conn) {
     conn.on('open', () => {
       this.connections.set(conn.peer, conn);
@@ -248,6 +299,7 @@ class NetworkManager {
       this.players = new Map(message.players.map(p => [p.id, p]));
       this.hostId = message.hostId;
       this.bus.emit('players:update', this.getPlayers());
+      this.bus.emit('network:status', 'Подключено к Banana Play лобби.');
     }
     if (message.type === 'LOBBY_FULL') this.bus.emit('network:error', 'Лобби заполнено: максимум 3 игрока.');
     this.bus.emit('network:message', { from, message });
@@ -379,6 +431,7 @@ class VoiceManager {
 
 class LobbyApp {
   constructor() {
+    inspectFirebaseState();
     this.bus = new EventBus();
     this.profile = this.loadProfile();
     this.network = new NetworkManager(this.bus);
@@ -398,9 +451,15 @@ class LobbyApp {
     $('#nicknameInput').addEventListener('input', () => this.updateProfilePreview());
     $('#enterHubBtn').addEventListener('click', () => this.enterHub());
     $('#editProfileBtn').addEventListener('click', () => this.showOnboarding());
-    $('#openHostModalBtn').addEventListener('click', () => $('#hostPasswordModal').showModal());
+    $('#openHostModalBtn').addEventListener('click', () => {
+      console.log('[DEBUG] createLobby clicked');
+      $('#hostPasswordModal').showModal();
+    });
     $('#confirmHostBtn').addEventListener('click', (event) => { event.preventDefault(); this.createLobbyWithPassword(); });
     $('#joinLobbyBtn').addEventListener('click', () => this.joinLobby());
+    $('#peerIdInput').addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') this.joinLobby();
+    });
     $('#copyPeerBtn').addEventListener('click', async () => {
       await navigator.clipboard.writeText(this.network.peer?.id || '');
       this.chat.system('Peer ID скопирован в буфер обмена.');
@@ -420,7 +479,7 @@ class LobbyApp {
       $('#roleBadge').className = `badge ${role === 'host' ? 'warning' : 'success'}`;
       $('#ownPeerBox').classList.remove('hidden');
       $('#copyPeerBtn').textContent = peerId;
-      $('#connectionStatus').textContent = role === 'host' ? 'Лобби создано · поделитесь Peer ID' : 'Подключение к лобби…';
+      $('#connectionStatus').textContent = role === 'host' ? 'Лобби создано · поделитесь Peer ID' : 'Соединение открыто · ждём состояние лобби…';
       $('#chatStatus').textContent = 'online';
       $('#chatStatus').className = 'badge success';
       this.chat.system(role === 'host' ? 'Вы создали Banana Play лобби как host.' : 'Вы подключаетесь к Banana Play host-лобби.');
@@ -450,10 +509,21 @@ class LobbyApp {
   }
 
   loadProfile() {
-    const stored = JSON.parse(localStorage.getItem('banana-play-profile') || '{}');
-    return { name: stored.name || '', avatar: stored.avatar || AVATARS[0] };
+    try {
+      const stored = JSON.parse(localStorage.getItem('banana-play-profile') || '{}');
+      return { name: stored.name || '', avatar: stored.avatar || AVATARS[0] };
+    } catch (error) {
+      console.error('[DEBUG] localStorage profile read failed', error);
+      return { name: '', avatar: AVATARS[0] };
+    }
   }
-  saveProfile() { localStorage.setItem('banana-play-profile', JSON.stringify(this.profile)); }
+  saveProfile() {
+    try {
+      localStorage.setItem('banana-play-profile', JSON.stringify(this.profile));
+    } catch (error) {
+      console.error('[DEBUG] localStorage profile write failed', error);
+    }
+  }
   showOnboarding() {
     $('#onboarding').classList.add('is-active');
     $('#lobby').classList.remove('is-active');
@@ -485,6 +555,7 @@ class LobbyApp {
   }
 
   async createLobbyWithPassword() {
+    console.log('[DEBUG] createLobby clicked');
     const password = $('#hostPasswordInput').value;
     // Client-side UX lock: only the owner password unlocks host mode and lobby creation.
     if (password !== HOST_PASSWORD) {
@@ -498,6 +569,8 @@ class LobbyApp {
     try {
       $('#connectionStatus').textContent = 'Создаём Banana Play лобби…';
       await this.network.startHost();
+      const roomRef = { id: this.network.peer?.id };
+      console.log('[DEBUG] Room created', roomRef.id);
     } catch (error) {
       console.log('[network] Host start failed', error);
       this.bus.emit('network:error', formatPeerError(error));
@@ -505,7 +578,9 @@ class LobbyApp {
   }
 
   async joinLobby() {
+    console.log('[DEBUG] joinLobby clicked');
     const hostId = $('#peerIdInput').value.trim();
+    console.log('[DEBUG] roomId =', hostId);
     if (!hostId) return this.chat.system('Введите Peer ID существующего host-лобби.');
     this.network.setLocalPlayer({ name: this.profile.name || 'Игрок', avatar: this.profile.avatar });
     try {

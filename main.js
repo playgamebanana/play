@@ -3,8 +3,13 @@ const MAX_PLAYERS = 3;
 const AVATARS = ['🜂','🜁','🜃','🜄','🛸','🦊','🐙','🦉','🐲','🧿','⚡','🌙'];
 
 
-// Do not set host/key here: PeerJS automatically uses the official Cloud broker when those fields are omitted.
+// Keep PeerJS transport options centralized so the app can switch from PeerJS Cloud
+// to a self-hosted PeerServer by filling host/path without changing lobby logic.
 const PEER_CONFIG = {
+  host: '',
+  port: 443,
+  path: '/peerjs',
+  secure: true,
   debug: 2,
   config: {
     iceServers: [
@@ -13,6 +18,11 @@ const PEER_CONFIG = {
     ],
   },
 };
+
+const PING_TIMEOUT_MS = 5000;
+const STATE_SYNC_TIMEOUT_MS = 5000;
+const CLIENT_RECONNECT_INTERVAL_MS = 3000;
+const CLIENT_RECONNECT_MAX_ATTEMPTS = 10;
 
 function formatPeerError(error) {
   const type = error?.type || error?.name || '';
@@ -24,7 +34,7 @@ function formatPeerError(error) {
     'invalid-id': 'Некорректный Peer ID. Проверьте ID хоста и повторите подключение.',
     'invalid-key': 'PeerJS cloud отклонил ключ подключения. Попробуйте обновить страницу.',
     network: 'Не удалось подключиться к PeerJS-серверу. Откройте сайт через http:// или https://, проверьте интернет/VPN/блокировщики и попробуйте снова.',
-    'peer-unavailable': 'Хост с таким Peer ID не найден. Проверьте ID и убедитесь, что host-лобби уже создано.',
+    'peer-unavailable': 'Лобби не найдено. Проверьте Peer ID или попросите host пересоздать лобби.',
     'server-error': 'PeerJS Cloud сейчас недоступен из вашей сети или временно отвечает ошибкой. Приложение уже повторило подключение; попробуйте обновить страницу, отключить VPN/proxy/блокировщик или открыть сайт в другой сети.',
     'socket-error': 'WebSocket до PeerJS-сервера не открылся. Проверьте сеть, VPN, proxy или блокировщики.',
     'socket-closed': 'WebSocket до PeerJS-сервера закрылся. Попробуйте переподключиться.',
@@ -131,6 +141,13 @@ class NetworkManager {
     this.localPlayer = null;
     this.hostId = null;
     this.isOpening = false;
+    this.isHostReady = false;
+    this.isReconnectingHost = false;
+    this.isClosingPeer = false;
+    this.clientReconnectTimer = null;
+    this.clientReconnectAttempts = 0;
+    this.pendingPings = new Map();
+    this.pendingStateSync = null;
   }
 
   setLocalPlayer(player) { this.localPlayer = player; }
@@ -138,11 +155,18 @@ class NetworkManager {
   async startHost() {
     this.closeExistingPeer();
     this.role = 'host';
+    this.isHostReady = false;
+    this.bus.emit('network:preparing-host');
+    this.bus.emit('network:status', 'Подготовка лобби...');
     await this.openPeerWithRetry('host');
+    console.log('[DEBUG] HOST OPEN', this.peer.id);
     this.hostId = this.peer.id;
     this.localPlayer = { ...this.localPlayer, id: this.peer.id, isHost: true, mic: false, connected: true };
     this.players.set(this.peer.id, this.localPlayer);
+    this.isHostReady = true;
+    console.log('[DEBUG] HOST READY', this.peer.id);
     this.bus.emit('network:ready', { role: 'host', peerId: this.peer.id });
+    this.bus.emit('network:status', 'Лобби готово');
     this.bus.emit('players:update', this.getPlayers());
     console.log('[network] Host mode started', this.peer.id);
   }
@@ -151,21 +175,23 @@ class NetworkManager {
     this.closeExistingPeer();
     this.role = 'client';
     this.hostId = hostId;
+    this.clientReconnectAttempts = 0;
     await this.openPeerWithRetry('guest');
     this.localPlayer = { ...this.localPlayer, id: this.peer.id, isHost: false, mic: false, connected: true };
-    console.log('[DEBUG] Joining room...');
-    const conn = this.peer.connect(hostId, { reliable: true, metadata: { player: this.localPlayer } });
-    this.registerConnection(conn);
-    await this.waitConnectionOpen(conn, hostId);
+    const conn = await this.connectToHost(hostId);
+    await this.pingHost(conn);
+    conn.send({ type: 'HELLO', player: this.localPlayer });
+    console.log('[DEBUG] HELLO SENT', hostId);
+    await this.waitForStateSync();
     this.bus.emit('network:ready', { role: 'client', peerId: this.peer.id });
-    console.log('[network] Client peer opened', this.peer.id, 'connected to', hostId);
+    console.log('[DEBUG] CLIENT CONNECTED', this.peer.id, 'connected to', hostId);
   }
 
   async openPeerWithRetry(rolePrefix, maxAttempts = 4) {
     let lastError = null;
+    let peerId = this.generatePeerId(rolePrefix);
     this.isOpening = true;
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-      const peerId = this.generatePeerId(rolePrefix);
       this.peer = this.createPeer(peerId);
       this.bindPeerEvents();
       try {
@@ -174,11 +200,19 @@ class NetworkManager {
         return;
       } catch (error) {
         lastError = error;
-        console.log(`[network] Peer open attempt ${attempt} failed`, error);
+        const type = error?.type || error?.name;
+        console.log(`[network] Peer open attempt ${attempt} failed for ${peerId}`, error);
+        this.isClosingPeer = true;
         if (this.peer && !this.peer.destroyed && typeof this.peer.destroy === 'function') this.peer.destroy();
+        setTimeout(() => { this.isClosingPeer = false; }, 0);
         this.peer = null;
         if (!this.isRetryableOpenError(error) || attempt === maxAttempts) break;
-        this.bus.emit('network:status', `PeerJS Cloud не открыл Peer ID, пробуем новый ID ${attempt + 1}/${maxAttempts}…`);
+        if (type === 'unavailable-id') {
+          peerId = this.generatePeerId(rolePrefix);
+          this.bus.emit('network:status', `Peer ID занят, пробуем новый ID ${attempt + 1}/${maxAttempts}…`);
+        } else {
+          this.bus.emit('network:status', `PeerJS Cloud не открыл соединение, повторяем тот же Peer ID ${attempt + 1}/${maxAttempts}…`);
+        }
         await sleep(650 * attempt);
       }
     }
@@ -202,27 +236,54 @@ class NetworkManager {
     if (location.protocol === 'file:') {
       console.warn('[network] App is opened via file://; PeerJS/WebRTC can be unstable. Use a local http server or GitHub Pages.');
     }
-    // Supplying a browser-generated ID avoids the PeerJS Cloud /id endpoint,
-    // which is the part that often returns server-error on the free broker.
-    return new Peer(peerId, PEER_CONFIG);
+    // Empty host means PeerJS Cloud. Fill PEER_CONFIG.host later to use a self-hosted PeerServer.
+    const options = PEER_CONFIG.host ? PEER_CONFIG : (({ host, port, path, secure, ...cloudConfig }) => cloudConfig)(PEER_CONFIG);
+    return new Peer(peerId, options);
   }
 
   closeExistingPeer() {
+    this.isClosingPeer = true;
+    this.stopClientReconnect();
+    this.pendingPings.forEach(({ reject, timer }) => {
+      clearTimeout(timer);
+      reject(new Error('Peer connection closed.'));
+    });
+    this.pendingPings.clear();
+    if (this.pendingStateSync) {
+      clearTimeout(this.pendingStateSync.timer);
+      this.pendingStateSync.reject(new Error('Peer connection closed before STATE_SYNC.'));
+      this.pendingStateSync = null;
+    }
     this.connections.forEach(conn => conn.close());
     this.connections.clear();
     if (this.peer && !this.peer.destroyed && typeof this.peer.destroy === 'function') this.peer.destroy();
     this.peer = null;
     this.players.clear();
+    this.isHostReady = false;
+    setTimeout(() => { this.isClosingPeer = false; }, 0);
   }
 
   bindPeerEvents() {
     this.peer.on('connection', (conn) => this.registerConnection(conn));
     this.peer.on('call', (call) => this.bus.emit('voice:incoming-call', call));
-    this.peer.on('disconnected', () => this.bus.emit('network:status', 'PeerJS disconnected. Попробуйте reconnect.'));
-    this.peer.on('close', () => this.bus.emit('network:status', 'Соединение закрыто.'));
+    this.peer.on('disconnected', () => this.handlePeerDisconnected('disconnected'));
+    this.peer.on('close', () => {
+      if (!this.isClosingPeer && this.role === 'client') this.scheduleClientReconnect();
+      this.bus.emit('network:status', 'Соединение закрыто.');
+    });
     this.peer.on('error', (error) => {
       console.log('[network] PeerJS error', error);
+      const type = error?.type || error?.name;
+      if (this.role === 'host' && ['network', 'socket-closed', 'disconnected'].includes(type)) this.reconnectHost();
       if (!this.isOpening) this.bus.emit('network:error', formatPeerError(error));
+    });
+    this.peer.on('open', () => {
+      if (this.isReconnectingHost) {
+        this.isReconnectingHost = false;
+        this.isHostReady = true;
+        console.log('[DEBUG] RECONNECT SUCCESS', this.peer.id);
+        this.bus.emit('network:status', 'Лобби восстановлено');
+      }
     });
   }
 
@@ -233,7 +294,7 @@ class NetworkManager {
     });
   }
 
-  waitConnectionOpen(conn, hostId, timeoutMs = 12000) {
+  waitConnectionOpen(conn, hostId, timeoutMs = PING_TIMEOUT_MS) {
     return new Promise((resolve, reject) => {
       const snapshot = { exists: () => Boolean(conn.open) };
       if (snapshot.exists()) {
@@ -250,46 +311,169 @@ class NetworkManager {
         callback(value);
       };
       const timer = setTimeout(() => {
-        finish(reject, new Error(`Document does not exist: host lobby ${hostId} was not found or did not answer in time.`));
+        finish(reject, new Error('Хост не отвечает. Возможно он закрыл вкладку или потерял соединение.'));
       }, timeoutMs);
       conn.on('open', () => finish(resolve));
       conn.on('error', (error) => finish(reject, error));
-      conn.on('close', () => finish(reject, new Error(`Document does not exist: host lobby ${hostId} is closed.`)));
+      conn.on('close', () => finish(reject, new Error('Хост недоступен или уже закрыл лобби')));
     });
+  }
+
+
+  connectToHost(hostId) {
+    console.log('[DEBUG] CLIENT CONNECTING', hostId);
+    console.log('[DEBUG] Joining room...');
+    const conn = this.peer.connect(hostId, { reliable: true, metadata: { player: this.localPlayer } });
+    this.registerConnection(conn);
+    return this.waitConnectionOpen(conn, hostId).then(() => conn);
+  }
+
+  pingHost(conn, timeoutMs = PING_TIMEOUT_MS) {
+    return new Promise((resolve, reject) => {
+      const pingId = uid();
+      const timer = setTimeout(() => {
+        this.pendingPings.delete(pingId);
+        reject(new Error('Хост недоступен или уже закрыл лобби'));
+      }, timeoutMs);
+      this.pendingPings.set(pingId, {
+        resolve: () => {
+          clearTimeout(timer);
+          this.pendingPings.delete(pingId);
+          console.log('[DEBUG] PONG RECEIVED', conn.peer);
+          resolve();
+        },
+        reject,
+        timer,
+      });
+      console.log('[DEBUG] PING SENT', conn.peer);
+      conn.send({ type: 'PING', pingId });
+    });
+  }
+
+  waitForStateSync(timeoutMs = STATE_SYNC_TIMEOUT_MS) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        console.warn('[DEBUG] STATE_SYNC not received in 5 seconds', this.hostId);
+        this.pendingStateSync = null;
+        reject(new Error('Хост не отвечает. Возможно он закрыл вкладку или потерял соединение.'));
+      }, timeoutMs);
+      this.pendingStateSync = { resolve, reject, timer };
+    });
+  }
+
+  handlePeerDisconnected(reason) {
+    console.log('[DEBUG] RECONNECT START', reason);
+    if (this.role === 'host') {
+      this.reconnectHost();
+      return;
+    }
+    if (this.role === 'client') this.scheduleClientReconnect();
+    this.bus.emit('network:status', 'PeerJS disconnected. Пытаемся восстановить соединение…');
+  }
+
+  reconnectHost() {
+    if (!this.peer || this.peer.destroyed || this.isReconnectingHost) return;
+    this.isReconnectingHost = true;
+    this.isHostReady = false;
+    console.log('[DEBUG] RECONNECT START', this.peer.id);
+    this.bus.emit('network:status', 'Восстанавливаем лобби…');
+    try {
+      this.peer.reconnect();
+    } catch (error) {
+      this.isReconnectingHost = false;
+      console.log('[DEBUG] RECONNECT FAILED', error);
+      this.bus.emit('network:error', formatPeerError(error));
+    }
+  }
+
+  stopClientReconnect() {
+    if (this.clientReconnectTimer) clearTimeout(this.clientReconnectTimer);
+    this.clientReconnectTimer = null;
+  }
+
+  scheduleClientReconnect() {
+    if (this.role !== 'client' || !this.hostId || this.clientReconnectTimer || this.isClosingPeer) return;
+    if (this.clientReconnectAttempts >= CLIENT_RECONNECT_MAX_ATTEMPTS) {
+      console.log('[DEBUG] RECONNECT FAILED', this.hostId);
+      this.bus.emit('network:error', 'Хост не отвечает. Возможно он закрыл вкладку или потерял соединение.');
+      return;
+    }
+    this.clientReconnectAttempts += 1;
+    console.log('[DEBUG] RECONNECT START', `${this.clientReconnectAttempts}/${CLIENT_RECONNECT_MAX_ATTEMPTS}`, this.hostId);
+    this.bus.emit('network:status', `Переподключаемся к лобби… ${this.clientReconnectAttempts}/${CLIENT_RECONNECT_MAX_ATTEMPTS}`);
+    this.clientReconnectTimer = setTimeout(async () => {
+      this.clientReconnectTimer = null;
+      try {
+        if (!this.peer || this.peer.destroyed) await this.openPeerWithRetry('guest');
+        else if (this.peer.disconnected && typeof this.peer.reconnect === 'function') {
+          this.peer.reconnect();
+          await Promise.race([
+            this.waitOpen(),
+            sleep(5000).then(() => { throw new Error('PeerJS reconnect timeout'); }),
+          ]);
+        }
+        const conn = await this.connectToHost(this.hostId);
+        await this.pingHost(conn);
+        conn.send({ type: 'HELLO', player: this.localPlayer });
+        console.log('[DEBUG] HELLO SENT', this.hostId);
+        await this.waitForStateSync();
+        this.clientReconnectAttempts = 0;
+        console.log('[DEBUG] RECONNECT SUCCESS', this.hostId);
+        this.bus.emit('network:status', 'Подключение к лобби восстановлено.');
+      } catch (error) {
+        console.log('[DEBUG] RECONNECT FAILED', error);
+        this.scheduleClientReconnect();
+      }
+    }, CLIENT_RECONNECT_INTERVAL_MS);
   }
 
   registerConnection(conn) {
     conn.on('open', () => {
       this.connections.set(conn.peer, conn);
       console.log('[network] data connection open', conn.peer);
+      if (this.role === 'client') console.log('[DEBUG] CLIENT CONNECTED', conn.peer);
       if (this.role === 'host') {
-        const player = conn.metadata?.player || { id: conn.peer, name: 'Игрок', avatar: '🜁' };
-        if (this.players.size >= MAX_PLAYERS) {
-          conn.send({ type: 'LOBBY_FULL' });
-          conn.close();
-          return;
-        }
-        this.players.set(conn.peer, { ...player, id: conn.peer, isHost: false, connected: true, mic: false });
-        this.broadcast({ type: 'STATE_SYNC', players: this.getPlayers(), hostId: this.hostId }, true);
-        this.bus.emit('players:update', this.getPlayers());
-        this.bus.emit('system', `${player.name} подключился к лобби.`);
-      } else {
-        conn.send({ type: 'HELLO', player: this.localPlayer });
+        setTimeout(() => {
+          if (this.connections.has(conn.peer) && !this.players.has(conn.peer)) {
+            console.warn('[DEBUG] HELLO not received in 5 seconds', conn.peer);
+          }
+        }, STATE_SYNC_TIMEOUT_MS);
       }
       this.bus.emit('network:connection-open', conn.peer);
     });
     conn.on('data', (message) => this.handleMessage(conn.peer, message));
     conn.on('close', () => this.handleClose(conn.peer));
-    conn.on('error', (error) => this.bus.emit('network:error', formatPeerError(error)));
+    conn.on('error', (error) => {
+      const type = error?.type || error?.name;
+      if (this.role === 'client' && ['peer-unavailable', 'network', 'socket-closed', 'disconnected'].includes(type)) this.scheduleClientReconnect();
+      this.bus.emit('network:error', formatPeerError(error));
+    });
   }
 
   handleMessage(from, message) {
     console.log('[network] message', from, message.type);
+    if (message.type === 'PING') {
+      if (this.role === 'host' && this.isHostReady) {
+        this.connections.get(from)?.send({ type: 'PONG', pingId: message.pingId });
+      }
+      return;
+    }
+    if (message.type === 'PONG') {
+      this.pendingPings.get(message.pingId)?.resolve();
+      return;
+    }
     if (this.role === 'host') {
       if (message.type === 'HELLO') {
-        this.players.set(from, { ...message.player, id: from, isHost: false, connected: true });
+        const player = message.player || { id: from, name: 'Игрок', avatar: '🜁' };
+        if (this.players.size >= MAX_PLAYERS && !this.players.has(from)) {
+          this.connections.get(from)?.send({ type: 'LOBBY_FULL' });
+          this.connections.get(from)?.close();
+          return;
+        }
+        this.players.set(from, { ...player, id: from, isHost: false, connected: true });
         this.broadcast({ type: 'STATE_SYNC', players: this.getPlayers(), hostId: this.hostId }, true);
         this.bus.emit('players:update', this.getPlayers());
+        this.bus.emit('system', `${player.name} подключился к лобби.`);
         return;
       }
       // Host is authoritative router: every lobby, chat and game event is rebroadcast to all clients.
@@ -300,6 +484,11 @@ class NetworkManager {
       this.hostId = message.hostId;
       this.bus.emit('players:update', this.getPlayers());
       this.bus.emit('network:status', 'Подключено к Banana Play лобби.');
+      if (this.pendingStateSync) {
+        clearTimeout(this.pendingStateSync.timer);
+        this.pendingStateSync.resolve();
+        this.pendingStateSync = null;
+      }
     }
     if (message.type === 'LOBBY_FULL') this.bus.emit('network:error', 'Лобби заполнено: максимум 3 игрока.');
     this.bus.emit('network:message', { from, message });
@@ -314,11 +503,16 @@ class NetworkManager {
       this.bus.emit('players:update', this.getPlayers());
       this.bus.emit('system', `${player.name} отключился.`);
     }
+    if (this.role === 'client' && peerId === this.hostId && !this.isClosingPeer) this.scheduleClientReconnect();
   }
 
   send(message) {
     if (this.role === 'host') this.broadcast({ ...message, from: this.peer.id }, true);
-    else this.connections.get(this.hostId)?.send(message);
+    else {
+      const conn = this.connections.get(this.hostId);
+      if (conn?.open) conn.send(message);
+      else this.scheduleClientReconnect();
+    }
   }
 
   broadcast(message, includeSelf = false) {
@@ -473,6 +667,12 @@ class LobbyApp {
       const message = { type: 'CHAT', id: uid(), author: this.profile.name, authorId: this.network.peer?.id || 'local', text, time: now() };
       this.network.send(message);
       if (this.network.role === 'offline') this.chat.add({ ...message, kind: 'own' });
+    });
+    this.bus.on('network:preparing-host', () => {
+      $('#ownPeerBox').classList.add('hidden');
+      $('#copyPeerBtn').textContent = '';
+      $('#roleBadge').textContent = 'preparing';
+      $('#roleBadge').className = 'badge warning';
     });
     this.bus.on('network:ready', ({ role, peerId }) => {
       $('#roleBadge').textContent = role;
